@@ -66,25 +66,25 @@ def test_spot_check_case_totals_rt(output_wb):
 def test_qa_flag_column_known_issues(output_wb):
     """
     QA flags correctly surface real source-data issues found in the sample:
-      - Case MON / Schmidt MON: total_hrs is #VALUE! (formula error in source Excel)
+      - Case MON / Schmidt MON: Start cell L5 = 'OFF' (text in a time cell)
       - MacKenzie SUN: no time data (employee off that day)
       - Covey all 7 days: no time data (employee had no hours this week)
-    Any row not flagged must be OK or TOTALS.
+      - Case/Schmidt TOTALS: BB9 was #VALUE!, recomputed from day rows
     """
     df = output_wb["data"]
-    valid_flags = {
-        "OK", "TOTALS", "no time data", "total_hrs='#VALUE!'",
-        "TOTALS; Total Hours computed (BB9='#VALUE!')",
-    }
-    unexpected = df[~df["QA_Flag"].isin(valid_flags)]
-    assert len(unexpected) == 0, f"Unrecognised QA flags:\n{unexpected[['Employee Name','Day','QA_Flag']]}"
 
-    # Spot-check known flags
+    # Spot-check the specific cell+value flags
     case_mon = df[(df["Employee Name"] == "Case; Kory V") & (df["Day"] == "MON")]
-    assert case_mon["QA_Flag"].iloc[0] == "total_hrs='#VALUE!'"
+    assert case_mon["QA_Flag"].iloc[0] == "Start cell L5 = 'OFF' — not a time"
+
+    schmidt_mon = df[(df["Employee Name"] == "Schmidt; Eric M") & (df["Day"] == "MON")]
+    assert schmidt_mon["QA_Flag"].iloc[0] == "Start cell L5 = 'OFF' — not a time"
 
     covey = df[(df["Employee Name"] == "Covey; Lawrence Peter") & (df["Day"] != "TOTALS")]
     assert (covey["QA_Flag"] == "no time data").all()
+
+    case_totals = df[(df["Employee Name"] == "Case; Kory V") & (df["Day"] == "TOTALS")]
+    assert case_totals["QA_Flag"].iloc[0] == "Total Hours cell BB9 = '#VALUE!' — recomputed from day rows"
 
 
 # ── QA_Summary sheet ───────────────────────────────────────────────────────────

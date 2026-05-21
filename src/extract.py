@@ -119,16 +119,41 @@ def infer_box_name(filename: str) -> str:
     return stem
 
 
-def _row_qa_flag(day_label: str, time_start, lunch_out, lunch_in, stop, total_hrs) -> str:
-    """Return a QA flag string describing any extraction issues on a day row."""
+def _is_time_value(v) -> bool:
+    """True if v is a recognisable time: datetime, time, or float fraction-of-day."""
+    if isinstance(v, (datetime, time)):
+        return True
+    if isinstance(v, float) and 0.0 <= v < 1.0:
+        return True
+    return False
+
+
+def _row_qa_flag(time_cells: dict, total_hrs, total_hrs_cell: str) -> str:
+    """
+    Return a QA flag describing extraction issues on a day row.
+
+    time_cells: ordered dict {field_name: (cell_address, value)} for Start/Lunch Out/Lunch In/Stop.
+    total_hrs:  raw value of the row-9 Total Hours cell.
+    total_hrs_cell: address of that cell (e.g. 'L9').
+    """
+    # All four time cells empty → employee was off / no entry
+    if all(v is None for (_addr, v) in time_cells.values()):
+        return "no time data"
+
     issues = []
-    if day_label != "TOTALS":
-        # Check if expected time fields are missing (not just OFF/blank)
-        if time_start is None and lunch_out is None and stop is None:
-            issues.append("no time data")
-        # total_hrs is a string when it was #VALUE! in the source
-        if isinstance(total_hrs, str):
-            issues.append(f"total_hrs={total_hrs!r}")
+    # Any time cell containing a non-time value (e.g. "OFF", "VAC", "-", "6am") is the
+    # likely cause of a downstream formula error in the Total Hours cell.
+    for field_name, (addr, val) in time_cells.items():
+        if val is None or _is_time_value(val):
+            continue
+        issues.append(f"{field_name} cell {addr} = {val!r} — not a time")
+
+    # If Total Hours itself is a string (formula error), report it. When we've already
+    # named the bad input above, this is redundant noise, so we only add it if no
+    # input cell explained the error.
+    if isinstance(total_hrs, str) and not issues:
+        issues.append(f"Total Hours cell {total_hrs_cell} = {total_hrs!r} (source formula error)")
+
     return "; ".join(issues) if issues else "OK"
 
 
@@ -155,7 +180,13 @@ def extract_sheet(ws, folder_name: str, box_name: str, excel_name: str) -> list[
         for i, col_name in enumerate(HOUR_COLS):
             day_hours[col_name] = coerce_hours(ws.cell(row=24, column=start_idx + i).value)
 
-        qa_flag = _row_qa_flag(day_label, time_start, lunch_out, lunch_in, stop, total_hrs)
+        time_cells = {
+            "Start":     (f"{start_col}5", time_start),
+            "Lunch Out": (f"{start_col}6", lunch_out),
+            "Lunch In":  (f"{start_col}7", lunch_in),
+            "Stop":      (f"{start_col}8", stop),
+        }
+        qa_flag = _row_qa_flag(time_cells, total_hrs, f"{start_col}9")
 
         rows.append({
             "Folder Name":   folder_name,
@@ -199,10 +230,12 @@ def extract_sheet(ws, folder_name: str, box_name: str, excel_name: str) -> list[
         grand_total_hours = round(
             sum(r["Total Hours"] for r in rows if r["Total Hours"] is not None), 4
         )
-        totals_flag = f"TOTALS; Total Hours computed (BB9={grand_total_hours_raw!r})"
+        totals_flag = (
+            f"Total Hours cell {TOTAL_HOURS_GRAND_CELL} = {grand_total_hours_raw!r} "
+            f"— recomputed from day rows"
+        )
     else:
-        totals_flag = "TOTALS" if grand_total_hours is not None or grand_total_hours_raw is None \
-                      else f"TOTALS; grand_total_hours={grand_total_hours_raw!r}"
+        totals_flag = "OK"
 
     rows.append({
         "Folder Name":   folder_name,
@@ -297,18 +330,20 @@ def _write_excel(out_path: Path, data_df: pd.DataFrame, qa_rows: list[dict], run
     wb = openpyxl.load_workbook(out_path)
 
     # --- Data sheet: colour QA_Flag column ---
+    # Grey tint for TOTALS rows is driven off the Day column, not QA_Flag —
+    # QA_Flag now carries pure status only ("OK" or a specific issue).
     ws_data = wb["Data"]
-    qa_col_idx = data_df.columns.get_loc("QA_Flag") + 1  # 1-based
+    qa_col_idx  = data_df.columns.get_loc("QA_Flag") + 1  # 1-based
+    day_col_idx = data_df.columns.get_loc("Day") + 1
     for row in ws_data.iter_rows(min_row=2, max_row=ws_data.max_row):
         cell = row[qa_col_idx - 1]
         val  = str(cell.value or "")
+        is_totals_row = str(row[day_col_idx - 1].value or "") == "TOTALS"
         if val == "OK":
-            cell.fill = _GREEN
-        elif val == "TOTALS":
-            cell.fill = _GREY
+            cell.fill = _GREY if is_totals_row else _GREEN
         else:
             cell.fill = _RED
-        cell.font = Font(bold=(val not in ("OK", "TOTALS")))
+        cell.font = Font(bold=(val != "OK"))
 
     # Auto-width Data sheet
     for col_cells in ws_data.columns:
