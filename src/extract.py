@@ -191,8 +191,18 @@ def extract_sheet(ws, folder_name: str, box_name: str, excel_name: str) -> list[
 
     grand_total_hours_raw = ws[TOTAL_HOURS_GRAND_CELL].value
     grand_total_hours = coerce_total_hours(grand_total_hours_raw)
-    totals_flag = "TOTALS" if grand_total_hours is not None or grand_total_hours_raw is None \
-                  else f"TOTALS; grand_total_hours={grand_total_hours_raw!r}"
+
+    # BB9 has a formula error (e.g. #VALUE! because some days had "OFF" or other
+    # non-time text in the time cells, making Excel's arithmetic fail).
+    # Fall back to summing valid daily Total Hours already extracted.
+    if grand_total_hours is None and grand_total_hours_raw is not None:
+        grand_total_hours = round(
+            sum(r["Total Hours"] for r in rows if r["Total Hours"] is not None), 4
+        )
+        totals_flag = f"TOTALS; Total Hours computed (BB9={grand_total_hours_raw!r})"
+    else:
+        totals_flag = "TOTALS" if grand_total_hours is not None or grand_total_hours_raw is None \
+                      else f"TOTALS; grand_total_hours={grand_total_hours_raw!r}"
 
     rows.append({
         "Folder Name":   folder_name,

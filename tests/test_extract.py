@@ -74,7 +74,7 @@ def test_qa_flag_column_known_issues(output_wb):
     df = output_wb["data"]
     valid_flags = {
         "OK", "TOTALS", "no time data", "total_hrs='#VALUE!'",
-        "TOTALS; grand_total_hours='#VALUE!'",
+        "TOTALS; Total Hours computed (BB9='#VALUE!')",
     }
     unexpected = df[~df["QA_Flag"].isin(valid_flags)]
     assert len(unexpected) == 0, f"Unrecognised QA flags:\n{unexpected[['Employee Name','Day','QA_Flag']]}"
@@ -134,9 +134,9 @@ def test_totals_row_total_hours_populated(output_wb):
     sanders_totals = df[(df["Employee Name"] == "Sanders; Travis P.") & (df["Day"] == "TOTALS")].iloc[0]
     assert float(sanders_totals["Total Hours"]) == pytest.approx(111.0)
 
-    # Case has #VALUE! in BB9, so TOTALS row Total Hours should be blank/NaN
+    # Case has #VALUE! in BB9, so Total Hours is computed from valid daily rows — must be a real number
     case_totals = df[(df["Employee Name"] == "Case; Kory V") & (df["Day"] == "TOTALS")].iloc[0]
-    assert pd.isna(case_totals["Total Hours"])
+    assert not pd.isna(case_totals["Total Hours"]), "Expected computed Total Hours for Case TOTALS, got NaN"
 
 
 # ── Run_Info sheet ─────────────────────────────────────────────────────────────
