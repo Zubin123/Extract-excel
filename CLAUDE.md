@@ -1,193 +1,284 @@
-# CLAUDE.md — Instructions
+# CLAUDE.md — Project Instructions & Handoff Notes
 
-Build a Python script that converts a weekly-timesheet Excel workbook into a flat
-tabular output matching a given template.
+A robust, config-driven Python pipeline that extracts weekly timesheet data
+from multi-sheet Excel workbooks into a flat tabular output with layered QA.
 
----
-
-## 1. Files you'll work with
-
-Two Excel files (provided separately, place them in `data/` — see project layout below):
-
-- **Input sample**: `WE_01_08_22_CA_GF_S_-_WA_4939-0899-6263_1.xlsx`
-  → the source workbook to read from.
-- **Output template**: `Header_Template_New_Rev_1.xlsx`
-  → defines the exact column order and formatting of the output. Do not modify it; only read its header row to match the schema.
+> **This file is the source of truth for the project.** Read it end-to-end
+> when picking up the project on a new machine or in a new Claude session.
 
 ---
 
-## 2. Project layout — set this up first
+## 1. What this project does
+
+- **Input:** any number of weekly-timesheet `.xlsx` workbooks (sample folder
+  or a folder of 100s/1000s of files). Each workbook may contain reference
+  sheets + multiple per-employee timesheet sheets.
+- **Output:** a single Excel workbook with 5 tabs (Data, QA_Summary, Run_Info,
+  Unmatched_Sheets, ID_Conflicts) matching the header order of
+  `data/Header Template New_Rev 1.xlsx`.
+- **Goal:** near-100% extraction accuracy with self-validating checks; any
+  sheet that can't be safely extracted is flagged loudly rather than producing
+  silently-wrong numbers.
+
+---
+
+## 2. Files in this repo
 
 ```
-timesheet-poc/
-├── CLAUDE.md                ← this file
-├── pyproject.toml           ← created by `uv init`
-├── uv.lock                  ← created by uv
-├── .venv/                   ← gitignored
-├── .gitignore               ← include .venv/, output/, __pycache__/
-├── data/
-│   ├── WE_01_08_22_CA_GF_S_-_WA_4939-0899-6263_1.xlsx   ← input
-│   └── Header_Template_New_Rev_1.xlsx                   ← template
+Extract-excel/
+├── CLAUDE.md                       ← this file (read first)
+├── pyproject.toml                  ← deps (managed by `uv`)
+├── uv.lock
+├── .gitignore                      ← excludes data/sample*, most outputs, .venv
+├── config/
+│   └── schema.yaml                 ← profiles + output columns (edit to add variants)
 ├── src/
-│   └── extract.py           ← the script you'll build
-├── output/
-│   └── (generated files go here)
-└── tests/
-    └── test_extract.py
+│   ├── extract.py                  ← orchestrator + CLI
+│   ├── anchors.py                  ← structural primitives
+│   ├── qa.py                       ← layered QA checks
+│   └── probe.py                    ← dev tool to scan new file batches
+├── data/
+│   ├── WE 01 08 22 CA GF'S - WA 4939-0899-6263_1.xlsx   ← baseline input (tracked)
+│   ├── Header Template New_Rev 1.xlsx                    ← output column template (tracked)
+│   ├── sample/                                           ← NOT in git; ship via OneDrive
+│   └── sample1/                                          ← NOT in git; ship via OneDrive
+└── output/
+    ├── phase2_corpus_v2.xlsx       ← latest 40-file corpus result (tracked)
+    └── probe_report.xlsx           ← latest probe scan output (tracked)
 ```
+
+When starting on a new machine, copy `data/sample/` and `data/sample1/` from
+the shared drive into this repo's `data/` directory.
 
 ---
 
-## 3. Environment setup — use `uv` + `.venv`
-
-Always use `uv`. Never `pip install` into system Python. Never activate the venv manually — use `uv run` for every command.
+## 3. Quick start (new machine)
 
 ```bash
-# One-time setup
-uv init --python 3.12
+# 1. Install uv if you don't have it: https://docs.astral.sh/uv/
+# 2. Create venv and install deps
 uv venv
-uv add openpyxl pandas
-uv add --dev pytest
+uv sync
 
-# Running anything
-uv run python src/extract.py data/WE_01_08_22_CA_GF_S_-_WA_4939-0899-6263_1.xlsx
-uv run pytest tests/
+# 3. Copy data/sample/ and data/sample1/ from the shared drive into ./data/
+
+# 4. Run the extractor
+.venv\Scripts\python.exe src\extract.py data\ --out output\run.xlsx
+
+# 5. Or run the probe first on a new batch to check for layout drift
+.venv\Scripts\python.exe src\probe.py    # writes output/probe_report.xlsx
 ```
 
-Commit `pyproject.toml` and `uv.lock`. Gitignore `.venv/`.
+**Windows / PowerShell:** call `.venv\Scripts\python.exe` directly. `uv run`
+may not resolve if `uv` isn't on PATH globally.
 
 ---
 
-## 4. Input file structure (already verified — do not re-derive)
+## 4. How the pipeline works (high level)
 
-The input workbook has 16 sheets. **Skip** these 6 reference sheets:
+### Phase 1 — Anchor-based extraction (shipped)
+Layout discovery from structure, not hardcoded coordinates:
 
-```python
-REFERENCE_SHEETS = {
-    "Master Template (9) JOB",
-    "Certified Codes",
-    "Employees",
-    "Job Details",
-    "Job List",
-    "ColumnLists",
-}
-```
+1. **Sheet classifier** — a sheet is an employee sheet iff `A1` looks like a
+   person name AND `B2` is an integer EE ID. No reference-sheet name list.
+2. **Profile detection** — find `MON` in row 4; the column determines the
+   layout (`standard` at L vs `shifted` at M). Profiles declared in
+   `config/schema.yaml`.
+3. **Pay-totals row resolution** — scan rows 10–50; the right row is the one
+   where the 6 day-block pay-type sums equal the grand totals in BB..BG (or
+   BC..BH for shifted). Prefer the row with the largest non-zero magnitude
+   so we don't pick decoy all-zero summary rows. **Self-validating.**
+4. **No-grid employee sheets** — `Job`, `OVERHEAD- CA`, `Girtman - CA`, etc.
+   carry a real EE name+ID but no weekly grid. Each produces 8 placeholder
+   rows (MON–SUN + TOTALS) with `QA_Flag = "no time grid"`.
 
-The remaining 10 sheets are one weekly timesheet per employee (e.g. `Case`, `Sanders`, `Raper ` — note: preserve trailing spaces in sheet names).
+### Phase 2 — Layered QA (shipped)
+Each layer surfaces a specific class of issue without blocking extraction:
 
-Every employee sheet uses the **same fixed grid**:
+| Layer | Severity | Purpose |
+|---|---|---|
+| Per-pay-type daily sum vs grand total | fatal if mismatch | Authoritative; if this fails, extraction is wrong |
+| Time order (Start ≤ LO ≤ LI ≤ Stop) | `[CHECK]` | Swapped time cells |
+| Weekly hours plausibility (0–140h) | `[WARN]` | Typos / unit errors |
+| Date sequence + day-of-week alignment | `[CHECK]` | Off-by-day errors |
+| EE-ID consistency per workbook | tab | Same EE ID with different names |
+| Filename WE date vs MON in sheet | `[INFO]` | Stale template carry-overs |
 
-| Cell / range                       | Meaning                                           |
-|-----------------------------------|---------------------------------------------------|
-| `A1`                              | Employee Name (`"Last; First M"`)                 |
-| `B2`                              | Employee ID (int)                                 |
-| Row 3 at day-block start cols     | Date for that day                                 |
-| Row 4 at day-block start cols     | Day label (`MON`, `TUE`, etc.)                    |
-| Row 5                             | Start time per day                                |
-| Row 6                             | Lunch Out                                          |
-| Row 7                             | Lunch In                                           |
-| Row 8                             | Stop                                               |
-| Row 9                             | Total Hours per day (may be `#VALUE!` if OFF)     |
-| Row 13, col G                     | WC State                                          |
-| Row 13, col H                     | ST                                                |
-| Row 24                            | Per-day totals for RT/OT/DT/PD/4D/4A              |
-| `BB24, BC24, BD24, BE24, BF24, BG24` | Grand weekly totals (RT, OT, DT, PD, 4D, 4A)   |
+Severity legend in QA_Flag strings:
+- `[INFO]` — informational; extraction is fine, ignore unless auditing
+- `[WARN]` — unusual, glance at it
+- `[CHECK]` — two independent signals disagree, review
+- no prefix — extraction itself may be wrong (e.g. `#VALUE!`, OFF in time cell)
 
-Day blocks (6 columns each: RT, OT, DT, PD, 4D, 4A):
+### Sheet status (Overall column in QA_Summary)
+- `PASS` — daily sums match grand totals AND no `[CHECK]`/`[WARN]` flag
+- `REVIEW` — daily sums match BUT a `[CHECK]`/`[WARN]` flag is present
+- `FAIL` — daily sums don't match grand totals (extraction is wrong)
+- `NO_GRID` — no-grid employee sheet (8 blank rows)
 
-```python
-DAY_BLOCKS = [
-    ("MON",  "L",  "Q"),
-    ("TUE",  "R",  "W"),
-    ("WED",  "X",  "AC"),
-    ("THUR", "AD", "AI"),
-    ("FRI",  "AJ", "AO"),
-    ("SAT",  "AP", "AU"),
-    ("SUN",  "AV", "BA"),
-]
-```
-
-Load with `openpyxl.load_workbook(path, data_only=True)` so formulas return computed values.
+### Output tabs
+- **Data** — row-per-day (7 + 1 TOTALS per employee × all employees)
+- **QA_Summary** — one row per employee sheet; pay-type-by-pay-type comparison
+- **Run_Info** — run metadata, totals, overall result
+- **Unmatched_Sheets** — sheets the classifier accepted but extraction couldn't safely complete
+- **ID_Conflicts** — same EE ID → multiple names within one workbook
 
 ---
 
-## 5. Output format (read headers from `Header_Template_New_Rev_1.xlsx`)
+## 5. Latest results (40-workbook corpus)
 
-23 columns in this exact order:
+| Status | Count | Notes |
+|---|---|---|
+| PASS | **438** | grid-bearing sheets, all numbers verified |
+| REVIEW | 0 | clean after Phase 2 noise cleanup (see §7) |
+| NO_GRID | 23 | employee sheets without weekly time grid |
+| Unmatched | 0 | nothing fell through |
+| **Total output rows** | **~3,690** | 461 employees × 8 rows |
 
-```
-Folder Name | Box Name | Excel Name | Sheet Name | Employee Name | EE ID |
-WC State | ST | Date | Day | Start | Lunch Out | Lunch In | Stop |
-Total Hours | RT | OT | DT | PD | 4D | 4A | PTO | HP
-```
+Authoritative output: [output/phase2_corpus_v2.xlsx](output/phase2_corpus_v2.xlsx).
 
-### Rows to emit per employee
-- 7 day rows (MON → SUN, in that order — note SUN's date is the day *before* MON's)
-- 1 TOTALS row (`Day = "TOTALS"`, no Date / no time fields, hour totals from `BB24:BG24`)
-
-So 10 employees × 8 rows = **80 rows** for this sample.
-
-### Formatting
-- `Date` → `MM/DD/YY` (e.g. `01/03/22`)
-- Times → `H:MM AM/PM` (e.g. `6:00 AM`); blank when the source cell isn't a time (e.g. `"OFF"`)
-- Hour columns → numeric; treat `None` / blank as `0.0`; treat `#VALUE!` as `None`
-- `PTO` and `HP` → leave blank (not present in sample)
-- `Folder Name` → `"2022"` (CLI arg, default)
-- `Box Name` → `"WE 01 08 22"` (inferred from filename, or CLI arg)
-- `Excel Name` → basename of the input file
-- `Sheet Name` → the employee sheet's name
+`Case TUE RT = 8.0` and `Case TOTALS RT = 32.0` ✓ (original spec checks pass).
 
 ---
 
-## 6. Accuracy check (build this in)
+## 6. Layout reference (verified across 40 workbooks, 531 employee sheets)
 
-For each employee, after extraction, verify:
+**Fixed (never varies):**
+- Day-label row 4, date row 3, time rows 5–8, daily Total Hours row 9
+- Each day block is 6 columns wide in order `RT, OT, DT, PD, 4D, 4A`
+- Grand-total columns sit immediately right of the last day block
 
+**Variable (discovered at runtime):**
+- Pay-totals row: 22 different positions observed (13, 14, 15, 17, 18, 20, 22,
+  23, 24, 25, 28, 29, 30, 32, 33, 34, 37, 40, 41, 42)
+- Column profile: `standard` (MON at L) covers 464 sheets; `shifted` (MON at
+  M) covers 13 sheets
+
+Reference sheets (auto-rejected by structural classifier, no name list):
+`Job List`, `Equipment`, `Employees`, `Template`, `ColumnLists`, plus any
+sheet where `A1` isn't a person name or `B2` isn't an int.
+
+---
+
+## 7. Pay-type semantics (important for any future QA work)
+
+The pay model is **not uniform** across companies/sheets in this dataset:
+
+- `RT` = Regular Time. Hours worked at standard rate.
+- `OT` = Overtime. **Sometimes a premium on already-counted hours (so
+  Total Hours = RT + DT), sometimes additive (Total Hours = RT + OT + DT).**
+  This varies by company; do NOT assume a single formula.
+- `DT` = Double Time. Hours worked at 2× rate.
+- `PD` = Per Diem. Allowance, not always hours.
+- `4D`, `4A` = labelled allowance categories. Treat as opaque numbers.
+
+An earlier RT+DT vs Total Hours two-pass check produced false positives and
+was removed. Phase 1's per-pay-type sum-cross-check is the only universal
+invariant — that's the check `Overall=PASS` is built on.
+
+---
+
+## 8. Adding a new template variant (no code changes needed)
+
+If a new layout shows up (e.g. MON starts at column N), add a profile to
+`config/schema.yaml`:
+
+```yaml
+profiles:
+  alt_profile:
+    detect:
+      day_label_row: 4
+      day_label_first_col: N
+    day_label_row: 4
+    date_row: 3
+    time_rows: {Start: 5, "Lunch Out": 6, "Lunch In": 7, Stop: 8}
+    total_hours_row: 9
+    day_blocks:
+      day_labels:     [MON, TUE, WED, THUR, FRI, SAT, SUN]
+      day_start_cols: [N,   T,   Z,   AF,   AL,  AR,  AX]
+      pay_block_width: 6
+      pay_types: [RT, OT, DT, PD, 4D, 4A]
+    grand_totals:
+      cols:            [BD, BE, BF, BG, BH, BI]
+      total_hours_col: BD
+    anchors:
+      employee_name: A1
+      ee_id:         B2
+      wc_state:      G13
+      st:            H13
 ```
-sum(MON..SUN of column X)  ==  TOTALS-row column X
-```
 
-for each of: **RT, OT, DT, PD, 4D, 4A**. Tolerance 0.01. Print a per-employee pass/fail table to the console.
-
-Expected on the sample input: **10/10 employees pass.**
+Run `python src/probe.py` first to confirm the new column letters.
 
 ---
 
-## 7. CLI
+## 9. Outstanding work / known limitations
 
-```bash
-uv run python src/extract.py data/WE_01_08_22_CA_GF_S_-_WA_4939-0899-6263_1.xlsx \
-    --folder "2022" --box "WE 01 08 22" --out output/extracted.xlsx
-```
+1. **`Hall` / `Smith, Dustin` files extract `emp=0`.** Their JOB / OVERHEAD-CA
+   sheets have `A1=None` and `B2='EE: # '` (template placeholder). Would need
+   filename-based employee inference. Not yet implemented.
 
-Exit `0` on all-pass, `2` if any employee fails accuracy.
+2. **No parallelization.** Single-process; 5,000 files take ~4h sequential.
+   Adding `multiprocessing.Pool` over workbooks is a 1-day task for ~10× speedup.
 
----
+3. **Single large output workbook.** At 5,000 files, the output `.xlsx` is
+   too large for Excel. Switch to CSV/Parquet output for large runs.
 
-## 8. Test
+4. **No incremental processing.** Reruns re-extract everything. Adding
+   filename+mtime hashing to skip unchanged files is straightforward.
 
-Write `tests/test_extract.py` with at least:
-- Output has exactly 80 rows.
-- All 10 employees pass the accuracy check.
-- Spot check: Case TUE RT == 8.0, Case TOTALS RT == 32.0.
-
-Run with `uv run pytest`.
-
----
-
-## 9. Rules
-
-- **No LLM at runtime.** The grid is fixed, cell coordinates are known. Pure Python only.
-- **Don't re-derive the layout.** Section 4 is the verified spec. If something seems wrong, ask the user.
-- **Preserve trailing spaces** in sheet names.
-- **Don't hand-edit `pyproject.toml`** — use `uv add`.
-- **Don't modify the template file.** Only read its header row.
+5. **Operator's guide doesn't exist yet.** Non-engineers running at scale
+   need a one-page README of "run this command, look at these tabs, do X when
+   Y is flagged."
 
 ---
 
-## 10. Done when
+## 10. How to extend (good defaults)
 
-- `uv run python src/extract.py data/WE_01_08_22_CA_GF_S_-_WA_4939-0899-6263_1.xlsx` produces `output/extracted.xlsx`
-- Console shows `10/10 employees passed`
-- `uv run pytest` is green
-- The output file's column order matches `Header_Template_New_Rev_1.xlsx` row 1 exactly
+- **Adding an output column:** add to `output_columns` in
+  `config/schema.yaml`, then populate that key in the row dict in
+  `extract.py` (both `extract_sheet` and `extract_sheet_no_grid`).
+- **Adding a QA check:** write a small function in `src/qa.py` returning
+  `list[str]` of issue messages. Call it from `process_workbook` in
+  `extract.py`. Use the `[INFO]/[WARN]/[CHECK]` severity prefix convention.
+- **Adding a layout profile:** edit `config/schema.yaml`. No Python changes.
+- **Debugging a specific file:** copy into `data/`, run
+  `python src/extract.py "data\<file>.xlsx" --out output\debug.xlsx`, then
+  inspect the output's Data + QA_Summary tabs.
+
+---
+
+## 11. Rules (carry forward)
+
+- **No LLM at runtime.** Pure Python; deterministic.
+- **Never silently extract wrong data.** If a row/sheet can't be safely
+  resolved, flag it on Unmatched_Sheets or with a non-OK QA_Flag.
+- **Pay-type sub-hour values are real hours.** Never filter `0 <= v < 1` on
+  pay-type cells (the time-fraction filter belongs only on time-of-day cells,
+  rows 5–8).
+- **Preserve trailing spaces in sheet names.** They're load-bearing.
+- **Don't hand-edit `pyproject.toml`** — use `uv add` / `uv remove`.
+- **Don't modify** `data/Header Template New_Rev 1.xlsx`. Read-only reference.
+- **Don't ignore empty employee sheets.** If `A1` is a name and `B2` is an
+  ID, the sheet must produce 8 output rows even if the employee had zero
+  hours that week.
+- **Reference sheets are detected structurally, not by name list.**
+
+---
+
+## 12. Session continuity for Claude
+
+When resuming on a new machine, in priority order:
+
+1. Read this file (§4–§11 especially).
+2. Inspect [output/phase2_corpus_v2.xlsx](output/phase2_corpus_v2.xlsx)
+   Run_Info tab — that's the latest run's metadata.
+3. Inspect [output/probe_report.xlsx](output/probe_report.xlsx) for the
+   structural patterns observed in the corpus.
+4. Read `src/anchors.py` (the key technical artifact) and `src/qa.py`.
+5. Skim `config/schema.yaml` — all profile/column declarations live there;
+   the Python code is driven from it.
+
+Git history has the chronological story: Phase 1 (anchor-based extraction),
+Phase 2 (layered QA), Phase 2 v2 (noise cleanup — `[INFO]` downgrades,
+"OK (no time data)" relabel).

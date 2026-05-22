@@ -1,4 +1,13 @@
-"""Extract weekly timesheet data from Excel workbook into flat tabular output."""
+"""Extract weekly timesheet data from Excel workbook(s) into flat tabular output.
+
+Phase 1 of the robust pipeline:
+  - Config-driven profiles (config/schema.yaml)
+  - Structural sheet classification (no hardcoded reference-sheet name list)
+  - Pay-totals row discovered via sum cross-check
+  - Sheets that fail anchor resolution are listed on the Unmatched_Sheets tab
+"""
+
+from __future__ import annotations
 
 import argparse
 import re
@@ -7,43 +16,30 @@ from datetime import datetime, time
 from pathlib import Path
 
 import openpyxl
-from openpyxl.styles import Alignment, Font, PatternFill
 import pandas as pd
+import yaml
+from openpyxl.styles import Font, PatternFill
 
-REFERENCE_SHEETS = {
-    "Master Template (9) JOB",
-    "Certified Codes",
-    "Employees",
-    "Job Details",
-    "Job List",
-    "ColumnLists",
-}
+from anchors import (
+    classify_sheet,
+    col_letter_to_index,
+    resolve_pay_totals_row,
+    select_profile,
+    sheet_has_day_grid,
+)
+from qa import (
+    check_date_sequence,
+    check_ee_id_consistency,
+    check_filename_week_match,
+    check_time_order,
+    check_weekly_hours_range,
+    two_pass_totals_row,
+)
 
-DAY_BLOCKS = [
-    ("MON",  "L",  "Q"),
-    ("TUE",  "R",  "W"),
-    ("WED",  "X",  "AC"),
-    ("THUR", "AD", "AI"),
-    ("FRI",  "AJ", "AO"),
-    ("SAT",  "AP", "AU"),
-    ("SUN",  "AV", "BA"),
-]
+DEFAULT_DAY_LABELS = ["MON", "TUE", "WED", "THUR", "FRI", "SAT", "SUN"]
+DEFAULT_PAY_TYPES  = ["RT", "OT", "DT", "PD", "4D", "4A"]
 
-HOUR_COLS = ["RT", "OT", "DT", "PD", "4D", "4A"]
-TOTALS_COLS = ["BB", "BC", "BD", "BE", "BF", "BG"]
 
-# Grand weekly total for the "Total Hours" column (row 9 across days, summed in BB9)
-TOTAL_HOURS_GRAND_CELL = "BB9"
-
-OUTPUT_COLUMNS = [
-    "Folder Name", "Box Name", "Excel Name", "Sheet Name",
-    "Employee Name", "EE ID", "WC State", "ST",
-    "Date", "Day", "Start", "Lunch Out", "Lunch In", "Stop",
-    "Total Hours", "RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP",
-    "QA_Flag",
-]
-
-# Fill colours for QA sheet
 _GREEN  = PatternFill("solid", fgColor="C6EFCE")
 _RED    = PatternFill("solid", fgColor="FFC7CE")
 _YELLOW = PatternFill("solid", fgColor="FFEB9C")
@@ -51,12 +47,7 @@ _GREY   = PatternFill("solid", fgColor="D9D9D9")
 _BOLD   = Font(bold=True)
 
 
-def col_letter_to_index(col: str) -> int:
-    result = 0
-    for ch in col.upper():
-        result = result * 26 + (ord(ch) - ord("A") + 1)
-    return result
-
+# ── Formatters ──────────────────────────────────────────────────────────────
 
 def fmt_date(val) -> str:
     if val is None:
@@ -67,7 +58,6 @@ def fmt_date(val) -> str:
 
 
 def fmt_time(val) -> str:
-    """Return H:MM AM/PM string; blank when the value is not a recognisable time."""
     if val is None:
         return ""
     if isinstance(val, datetime):
@@ -77,7 +67,6 @@ def fmt_time(val) -> str:
         dt = datetime.combine(datetime.today(), val)
         fmt = "%#I:%M %p" if sys.platform == "win32" else "%-I:%M %p"
         return dt.strftime(fmt)
-    # Numeric fraction-of-day (Excel time serial stored as float)
     if isinstance(val, float) and 0.0 <= val < 1.0:
         total_minutes = round(val * 24 * 60)
         hours, minutes = divmod(total_minutes, 60)
@@ -88,7 +77,6 @@ def fmt_time(val) -> str:
 
 
 def coerce_hours(val) -> float:
-    """Numeric cell → float; None / string / error → 0.0."""
     if val is None:
         return 0.0
     if isinstance(val, (int, float)):
@@ -97,18 +85,11 @@ def coerce_hours(val) -> float:
 
 
 def coerce_total_hours(val):
-    """
-    For 'Total Hours' specifically: preserve the distinction between
-    a real numeric value, a blank cell, and a formula error.
-        numeric  → float
-        None     → None (blank)
-        string   → None  (e.g. '#VALUE!' — flagged separately)
-    """
     if val is None:
         return None
     if isinstance(val, (int, float)):
         return float(val)
-    return None  # error string like '#VALUE!'
+    return None
 
 
 def infer_box_name(filename: str) -> str:
@@ -120,7 +101,6 @@ def infer_box_name(filename: str) -> str:
 
 
 def _is_time_value(v) -> bool:
-    """True if v is a recognisable time: datetime, time, or float fraction-of-day."""
     if isinstance(v, (datetime, time)):
         return True
     if isinstance(v, float) and 0.0 <= v < 1.0:
@@ -129,64 +109,66 @@ def _is_time_value(v) -> bool:
 
 
 def _row_qa_flag(time_cells: dict, total_hrs, total_hrs_cell: str) -> str:
-    """
-    Return a QA flag describing extraction issues on a day row.
-
-    time_cells: ordered dict {field_name: (cell_address, value)} for Start/Lunch Out/Lunch In/Stop.
-    total_hrs:  raw value of the row-9 Total Hours cell.
-    total_hrs_cell: address of that cell (e.g. 'L9').
-    """
-    # All four time cells empty → employee was off / no entry
     if all(v is None for (_addr, v) in time_cells.values()):
-        return "no time data"
-
+        return "OK (no time data)"
     issues = []
-    # Any time cell containing a non-time value (e.g. "OFF", "VAC", "-", "6am") is the
-    # likely cause of a downstream formula error in the Total Hours cell.
     for field_name, (addr, val) in time_cells.items():
         if val is None or _is_time_value(val):
             continue
         issues.append(f"{field_name} cell {addr} = {val!r} — not a time")
-
-    # If Total Hours itself is a string (formula error), report it. When we've already
-    # named the bad input above, this is redundant noise, so we only add it if no
-    # input cell explained the error.
     if isinstance(total_hrs, str) and not issues:
         issues.append(f"Total Hours cell {total_hrs_cell} = {total_hrs!r} (source formula error)")
-
     return "; ".join(issues) if issues else "OK"
 
 
-def extract_sheet(ws, folder_name: str, box_name: str, excel_name: str) -> list[dict]:
+# ── Sheet extraction ────────────────────────────────────────────────────────
+
+def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
+                  box_name: str, excel_name: str) -> list[dict]:
     sheet_name = ws.title
-    employee_name = ws["A1"].value or ""
-    ee_id = ws["B2"].value
-    wc_state = ws["G13"].value or ""
-    st = ws["H13"].value or ""
+    anchors = profile["anchors"]
+    employee_name = ws[anchors["employee_name"]].value or ""
+    ee_id = ws[anchors["ee_id"]].value
+    wc_state = ws[anchors["wc_state"]].value or ""
+    st = ws[anchors["st"]].value or ""
+
+    db = profile["day_blocks"]
+    day_labels = db["day_labels"]
+    day_start_cols = db["day_start_cols"]
+    pay_types = db["pay_types"]
+
+    date_row = profile["date_row"]
+    total_hours_row = profile["total_hours_row"]
+    t_rows = profile["time_rows"]
 
     rows = []
 
-    for day_label, start_col, _ in DAY_BLOCKS:
+    for day_label, start_col in zip(day_labels, day_start_cols):
         start_idx = col_letter_to_index(start_col)
 
-        date_val   = ws.cell(row=3, column=start_idx).value
-        time_start = ws.cell(row=5, column=start_idx).value
-        lunch_out  = ws.cell(row=6, column=start_idx).value
-        lunch_in   = ws.cell(row=7, column=start_idx).value
-        stop       = ws.cell(row=8, column=start_idx).value
-        total_hrs  = ws.cell(row=9, column=start_idx).value
+        date_val   = ws.cell(row=date_row, column=start_idx).value
+        time_start = ws.cell(row=t_rows["Start"],     column=start_idx).value
+        lunch_out  = ws.cell(row=t_rows["Lunch Out"], column=start_idx).value
+        lunch_in   = ws.cell(row=t_rows["Lunch In"],  column=start_idx).value
+        stop       = ws.cell(row=t_rows["Stop"],      column=start_idx).value
+        total_hrs  = ws.cell(row=total_hours_row,     column=start_idx).value
 
         day_hours = {}
-        for i, col_name in enumerate(HOUR_COLS):
-            day_hours[col_name] = coerce_hours(ws.cell(row=24, column=start_idx + i).value)
+        for i, col_name in enumerate(pay_types):
+            day_hours[col_name] = coerce_hours(
+                ws.cell(row=pay_totals_row, column=start_idx + i).value
+            )
 
         time_cells = {
-            "Start":     (f"{start_col}5", time_start),
-            "Lunch Out": (f"{start_col}6", lunch_out),
-            "Lunch In":  (f"{start_col}7", lunch_in),
-            "Stop":      (f"{start_col}8", stop),
+            "Start":     (f"{start_col}{t_rows['Start']}",     time_start),
+            "Lunch Out": (f"{start_col}{t_rows['Lunch Out']}", lunch_out),
+            "Lunch In":  (f"{start_col}{t_rows['Lunch In']}",  lunch_in),
+            "Stop":      (f"{start_col}{t_rows['Stop']}",      stop),
         }
-        qa_flag = _row_qa_flag(time_cells, total_hrs, f"{start_col}9")
+        base_flag = _row_qa_flag(time_cells, total_hrs, f"{start_col}{total_hours_row}")
+        order_issues = check_time_order(time_cells)
+        flag_parts = [p for p in [base_flag if base_flag != "OK" else None, *order_issues] if p]
+        qa_flag = "; ".join(flag_parts) if flag_parts else "OK"
 
         rows.append({
             "Folder Name":   folder_name,
@@ -204,34 +186,33 @@ def extract_sheet(ws, folder_name: str, box_name: str, excel_name: str) -> list[
             "Lunch In":      fmt_time(lunch_in),
             "Stop":          fmt_time(stop),
             "Total Hours":   coerce_total_hours(total_hrs),
-            "RT":  day_hours["RT"],
-            "OT":  day_hours["OT"],
-            "DT":  day_hours["DT"],
-            "PD":  day_hours["PD"],
-            "4D":  day_hours["4D"],
-            "4A":  day_hours["4A"],
+            **{pt: day_hours[pt] for pt in pay_types},
             "PTO": "",
             "HP":  "",
             "QA_Flag": qa_flag,
         })
 
-    # TOTALS row — grand weekly totals from BB24:BG24 (pay types) and BB9 (Total Hours)
-    totals_hours = {}
-    for col_name, col_letter in zip(HOUR_COLS, TOTALS_COLS):
-        totals_hours[col_name] = coerce_hours(ws.cell(row=24, column=col_letter_to_index(col_letter)).value)
+    # TOTALS row — grand weekly totals from grand_totals.cols on pay_totals_row
+    # and total_hours_col on total_hours_row.
+    gt_cols = profile["grand_totals"]["cols"]
+    th_col = profile["grand_totals"]["total_hours_col"]
 
-    grand_total_hours_raw = ws[TOTAL_HOURS_GRAND_CELL].value
+    totals_hours = {}
+    for col_name, col_letter in zip(pay_types, gt_cols):
+        totals_hours[col_name] = coerce_hours(
+            ws.cell(row=pay_totals_row, column=col_letter_to_index(col_letter)).value
+        )
+
+    grand_th_cell = f"{th_col}{total_hours_row}"
+    grand_total_hours_raw = ws[grand_th_cell].value
     grand_total_hours = coerce_total_hours(grand_total_hours_raw)
 
-    # BB9 has a formula error (e.g. #VALUE! because some days had "OFF" or other
-    # non-time text in the time cells, making Excel's arithmetic fail).
-    # Fall back to summing valid daily Total Hours already extracted.
     if grand_total_hours is None and grand_total_hours_raw is not None:
         grand_total_hours = round(
             sum(r["Total Hours"] for r in rows if r["Total Hours"] is not None), 4
         )
         totals_flag = (
-            f"Total Hours cell {TOTAL_HOURS_GRAND_CELL} = {grand_total_hours_raw!r} "
+            f"Total Hours cell {grand_th_cell} = {grand_total_hours_raw!r} "
             f"— recomputed from day rows"
         )
     else:
@@ -253,12 +234,7 @@ def extract_sheet(ws, folder_name: str, box_name: str, excel_name: str) -> list[
         "Lunch In":      "",
         "Stop":          "",
         "Total Hours":   grand_total_hours,
-        "RT":  totals_hours["RT"],
-        "OT":  totals_hours["OT"],
-        "DT":  totals_hours["DT"],
-        "PD":  totals_hours["PD"],
-        "4D":  totals_hours["4D"],
-        "4A":  totals_hours["4A"],
+        **{pt: totals_hours[pt] for pt in pay_types},
         "PTO": "",
         "HP":  "",
         "QA_Flag": totals_flag,
@@ -267,33 +243,59 @@ def extract_sheet(ws, folder_name: str, box_name: str, excel_name: str) -> list[
     return rows
 
 
-def check_accuracy(employee_rows: list[dict]) -> tuple[bool, dict]:
-    """
-    Returns (all_pass, results_dict).
-    results_dict maps col → (daily_sum, grand_total, status).
-        status: "MATCH" | "MISMATCH" | "SKIPPED (#VALUE in source)"
-    Cross-check: sum of 7 extracted day values == Excel's pre-computed grand total.
-        Pay types  → row 24 (daily) vs BB24:BG24 (grand)
-        Total Hours → row 9  (daily) vs BB9       (grand)
-    SKIPPED rows don't fail the overall check (the source itself has the error,
-    not our extraction).
-    """
+def extract_sheet_no_grid(ws, folder_name: str, box_name: str,
+                          excel_name: str) -> list[dict]:
+    """Emit 8 blank rows (MON..SUN + TOTALS) for an employee sheet that has
+    no weekly day-label grid (e.g. 'Job' / 'OVERHEAD- CA')."""
+    sheet_name = ws.title
+    employee_name = ws["A1"].value or ""
+    ee_id = ws["B2"].value
+    wc_state = ws["G13"].value or ""
+    st = ws["H13"].value or ""
+
+    rows = []
+    for day_label in DEFAULT_DAY_LABELS + ["TOTALS"]:
+        row = {
+            "Folder Name":   folder_name,
+            "Box Name":      box_name,
+            "Excel Name":    excel_name,
+            "Sheet Name":    sheet_name,
+            "Employee Name": employee_name,
+            "EE ID":         ee_id,
+            "WC State":      wc_state,
+            "ST":            st,
+            "Date":          "",
+            "Day":           day_label,
+            "Start":         "",
+            "Lunch Out":     "",
+            "Lunch In":      "",
+            "Stop":          "",
+            "Total Hours":   None,
+            **{pt: "" for pt in DEFAULT_PAY_TYPES},
+            "PTO": "",
+            "HP":  "",
+            "QA_Flag": "no time grid",
+        }
+        rows.append(row)
+    return rows
+
+
+def check_accuracy(employee_rows: list[dict], pay_types: list[str],
+                   tolerance: float) -> tuple[bool, dict]:
     day_rows   = [r for r in employee_rows if r["Day"] != "TOTALS"]
     totals_row = next(r for r in employee_rows if r["Day"] == "TOTALS")
 
     results  = {}
     all_pass = True
 
-    # Pay-type columns
-    for col in HOUR_COLS:
+    for col in pay_types:
         daily_sum   = round(sum(r[col] for r in day_rows), 4)
         grand_total = totals_row[col]
-        passed = abs(daily_sum - grand_total) <= 0.01
+        passed = abs(daily_sum - grand_total) <= tolerance
         results[col] = (daily_sum, grand_total, "MATCH" if passed else "MISMATCH")
         if not passed:
             all_pass = False
 
-    # Total Hours — both sides may contain None when source has #VALUE!
     daily_th_values = [r["Total Hours"] for r in day_rows]
     grand_th        = totals_row["Total Hours"]
     if any(v is None for v in daily_th_values) or grand_th is None:
@@ -303,8 +305,8 @@ def check_accuracy(employee_rows: list[dict]) -> tuple[bool, dict]:
             "SKIPPED (#VALUE in source)",
         )
     else:
-        daily_sum   = round(sum(daily_th_values), 4)
-        passed = abs(daily_sum - grand_th) <= 0.01
+        daily_sum = round(sum(daily_th_values), 4)
+        passed = abs(daily_sum - grand_th) <= tolerance
         results["Total Hours"] = (daily_sum, grand_th, "MATCH" if passed else "MISMATCH")
         if not passed:
             all_pass = False
@@ -312,58 +314,53 @@ def check_accuracy(employee_rows: list[dict]) -> tuple[bool, dict]:
     return all_pass, results
 
 
-def _write_excel(out_path: Path, data_df: pd.DataFrame, qa_rows: list[dict], run_info: dict):
-    """Write the three-sheet workbook with conditional formatting."""
+# ── Writer ──────────────────────────────────────────────────────────────────
+
+def _write_excel(out_path: Path, data_df: pd.DataFrame, qa_rows: list[dict],
+                 run_info: dict, unmatched: list[dict], id_conflicts: list[dict]):
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        # ── Sheet 1: Data ──────────────────────────────────────────────────
         data_df.to_excel(writer, sheet_name="Data", index=False)
+        pd.DataFrame(qa_rows).to_excel(writer, sheet_name="QA_Summary", index=False)
+        pd.DataFrame([run_info]).to_excel(writer, sheet_name="Run_Info", index=False)
+        pd.DataFrame(unmatched).to_excel(writer, sheet_name="Unmatched_Sheets", index=False)
+        pd.DataFrame(id_conflicts).to_excel(writer, sheet_name="ID_Conflicts", index=False)
 
-        # ── Sheet 2: QA_Summary ────────────────────────────────────────────
-        qa_df = pd.DataFrame(qa_rows)
-        qa_df.to_excel(writer, sheet_name="QA_Summary", index=False)
-
-        # ── Sheet 3: Run_Info ──────────────────────────────────────────────
-        run_df = pd.DataFrame([run_info])
-        run_df.to_excel(writer, sheet_name="Run_Info", index=False)
-
-    # Post-process: apply colours
     wb = openpyxl.load_workbook(out_path)
 
-    # --- Data sheet: colour QA_Flag column ---
-    # Grey tint for TOTALS rows is driven off the Day column, not QA_Flag —
-    # QA_Flag now carries pure status only ("OK" or a specific issue).
+    # Data sheet colouring
     ws_data = wb["Data"]
-    qa_col_idx  = data_df.columns.get_loc("QA_Flag") + 1  # 1-based
+    qa_col_idx  = data_df.columns.get_loc("QA_Flag") + 1
     day_col_idx = data_df.columns.get_loc("Day") + 1
     for row in ws_data.iter_rows(min_row=2, max_row=ws_data.max_row):
         cell = row[qa_col_idx - 1]
         val  = str(cell.value or "")
         is_totals_row = str(row[day_col_idx - 1].value or "") == "TOTALS"
-        if val == "OK":
+        # Treat as OK: literal "OK", "OK (no time data)", or anything where only
+        # [INFO] notes are attached and no [CHECK]/[WARN]/error prefix appears.
+        is_ok = (
+            val == "OK"
+            or val.startswith("OK (")
+            or ("[CHECK]" not in val and "[WARN]" not in val
+                and not any(tok in val for tok in ("— not a time", "#VALUE", "no time grid")))
+        )
+        if is_ok:
             cell.fill = _GREY if is_totals_row else _GREEN
         else:
             cell.fill = _RED
-        cell.font = Font(bold=(val != "OK"))
+        cell.font = Font(bold=not is_ok)
 
-    # Auto-width Data sheet
     for col_cells in ws_data.columns:
         max_len = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
         ws_data.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 30)
 
-    # --- QA_Summary sheet: colour Overall column + per-col match cells ---
+    # QA_Summary colouring
     ws_qa = wb["QA_Summary"]
     headers = [c.value for c in ws_qa[1]]
-
-    overall_idx = headers.index("Overall") + 1 if "Overall" in headers else None
-
     for row in ws_qa.iter_rows(min_row=2, max_row=ws_qa.max_row):
-        # Bold header (employee name)
         row[0].font = _BOLD
-
         for cell in row:
             col_header = headers[cell.column - 1] if cell.column <= len(headers) else ""
             val = str(cell.value or "")
-
             if col_header == "Overall":
                 cell.fill = _GREEN if val == "PASS" else _RED
                 cell.font = Font(bold=True)
@@ -375,113 +372,214 @@ def _write_excel(out_path: Path, data_df: pd.DataFrame, qa_rows: list[dict], run
                 else:
                     cell.fill = _RED
 
-    # Auto-width QA sheet
     for col_cells in ws_qa.columns:
         max_len = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
         ws_qa.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 30)
 
-    # Bold header row on all sheets
-    for sheet_name in ("Data", "QA_Summary", "Run_Info"):
+    # Header row + freeze panes on all sheets
+    for sheet_name in ("Data", "QA_Summary", "Run_Info", "Unmatched_Sheets", "ID_Conflicts"):
+        if sheet_name not in wb.sheetnames:
+            continue
         ws = wb[sheet_name]
         for cell in ws[1]:
             cell.font = Font(bold=True)
             cell.fill = PatternFill("solid", fgColor="BDD7EE")
-
-    # Freeze top row on all sheets
-    for sheet_name in ("Data", "QA_Summary", "Run_Info"):
-        wb[sheet_name].freeze_panes = "A2"
+        ws.freeze_panes = "A2"
 
     wb.save(out_path)
 
 
-def extract(input_path: str, folder_name: str, box_name: str | None, out_path: str) -> int:
-    input_path = Path(input_path)
-    excel_name = input_path.name
+# ── Pipeline ────────────────────────────────────────────────────────────────
 
+def load_config(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def process_workbook(input_path: Path, config: dict, folder_name: str,
+                     box_name: str | None) -> tuple[list[dict], list[dict], list[dict]]:
+    """Return (data_rows, qa_rows, unmatched_rows) for one workbook."""
+    excel_name = input_path.name
     if box_name is None:
         box_name = infer_box_name(excel_name)
 
+    profiles = config["profiles"]
+    tolerance = config.get("tolerance", 0.01)
+
     wb = openpyxl.load_workbook(input_path, data_only=True)
 
-    all_rows: list[dict]    = []
-    qa_rows:  list[dict]    = []
-    pass_count = 0
-    total_employees = 0
-
-    print(f"\n{'Employee':<25} {'RT':>8} {'OT':>8} {'DT':>8} {'PD':>8} {'4D':>8} {'4A':>8}  Status")
-    print("-" * 85)
+    data_rows: list[dict] = []
+    qa_rows: list[dict] = []
+    unmatched: list[dict] = []
 
     for sheet_name in wb.sheetnames:
-        if sheet_name in REFERENCE_SHEETS:
-            continue
         ws = wb[sheet_name]
-        emp_rows = extract_sheet(ws, folder_name, box_name, excel_name)
-        all_rows.extend(emp_rows)
+        kind = classify_sheet(ws, profiles)
+        if kind != "employee":
+            continue
 
-        total_employees += 1
-        passed, results = check_accuracy(emp_rows)
-        if passed:
-            pass_count += 1
+        # Employee sheets with no weekly grid (e.g. 'Job', 'OVERHEAD- CA') —
+        # emit 8 blank rows so the employee is still represented in output.
+        if not sheet_has_day_grid(ws, profiles):
+            no_grid_rows = extract_sheet_no_grid(ws, folder_name, box_name, excel_name)
+            data_rows.extend(no_grid_rows)
+            qa_rows.append({
+                "File":           excel_name,
+                "Employee":       no_grid_rows[0]["Employee Name"],
+                "Sheet Name":     sheet_name,
+                "Profile":        "(no grid)",
+                "Pay Totals Row": "",
+                "QA Method":      "no weekly day-label grid — 8 blank rows emitted",
+                "Tolerance":      tolerance,
+                "Overall":        "NO_GRID",
+            })
+            continue
 
+        profile_name = select_profile(ws, profiles)
+        if profile_name is None:
+            unmatched.append({
+                "File": excel_name, "Sheet": sheet_name,
+                "Reason": "no matching profile (day labels not at expected position)",
+            })
+            continue
+
+        profile = profiles[profile_name]
+        pay_totals_row, reason = resolve_pay_totals_row(ws, profile, tolerance=tolerance)
+        if pay_totals_row is None:
+            unmatched.append({
+                "File": excel_name, "Sheet": sheet_name,
+                "Reason": f"pay_totals_row unresolved: {reason}",
+            })
+            continue
+
+        emp_rows = extract_sheet(ws, profile, pay_totals_row,
+                                 folder_name, box_name, excel_name)
+
+        # Phase 2 sheet-level QA layers
+        day_rows = [r for r in emp_rows if r["Day"] != "TOTALS"]
+        totals_row = next(r for r in emp_rows if r["Day"] == "TOTALS")
+
+        sheet_issues: list[str] = []
+        sheet_issues += two_pass_totals_row(ws, profile, pay_totals_row, tolerance)
+        sheet_issues += check_weekly_hours_range(totals_row.get("Total Hours"))
+        sheet_issues += check_date_sequence(day_rows)
+        sheet_issues += check_filename_week_match(excel_name, day_rows)
+
+        # Surface sheet-level issues on the TOTALS row's QA_Flag
+        if sheet_issues:
+            existing = totals_row.get("QA_Flag", "OK")
+            extra = "; ".join(sheet_issues)
+            totals_row["QA_Flag"] = extra if existing == "OK" else f"{existing}; {extra}"
+
+        data_rows.extend(emp_rows)
+
+        passed, results = check_accuracy(emp_rows, profile["day_blocks"]["pay_types"], tolerance)
         emp_name = emp_rows[0]["Employee Name"]
-        status   = "PASS" if passed else "FAIL"
-
-        # Console line — short status per column
-        short_status = {"MATCH": "OK", "MISMATCH": "!!", "SKIPPED (#VALUE in source)": "sk"}
-        col_info = "  ".join(f"{col}:{short_status.get(r[2], '?')}" for col, r in results.items())
-        print(f"{emp_name:<25} {col_info}  {status}")
-
-        # Build QA_Summary row — one row per employee with full transparency
-        qa_row: dict = {
-            "Employee":    emp_name,
-            "Sheet Name":  sheet_name,
-            "QA Method":   "sum(MON..SUN) vs Excel grand total (pay types: BB24:BG24; Total Hours: BB9)",
-            "Tolerance":   0.01,
+        qa_row = {
+            "File":       excel_name,
+            "Employee":   emp_name,
+            "Sheet Name": sheet_name,
+            "Profile":    profile_name,
+            "Pay Totals Row": pay_totals_row,
+            "QA Method":  f"sum(MON..SUN) vs grand totals (row {pay_totals_row})",
+            "Tolerance":  tolerance,
         }
         for col, (daily_sum, grand_total, col_status) in results.items():
             qa_row[f"{col}_daily_sum"]   = daily_sum
             qa_row[f"{col}_grand_total"] = grand_total
             qa_row[f"{col}_match"]       = col_status
-        qa_row["Overall"] = status
+        qa_row["Sheet Issues"] = "; ".join(sheet_issues) if sheet_issues else ""
+        # REVIEW only if there's an actionable [CHECK] or [WARN]; [INFO] alone passes.
+        needs_review = any(("[CHECK]" in s or "[WARN]" in s) for s in sheet_issues)
+        qa_row["Overall"] = "PASS" if (passed and not needs_review) else ("REVIEW" if passed else "FAIL")
         qa_rows.append(qa_row)
 
-    print(f"\n{pass_count}/{total_employees} employees passed accuracy check.\n")
+    return data_rows, qa_rows, unmatched
+
+
+def extract(input_arg: str, folder_name: str, box_name: str | None, out_path: str,
+            config_path: str) -> int:
+    config = load_config(Path(config_path))
+    output_columns = config["output_columns"]
+
+    in_path = Path(input_arg)
+    files: list[Path]
+    if in_path.is_dir():
+        files = sorted([p for p in in_path.rglob("*.xlsx") if not p.name.startswith("~$")])
+    else:
+        files = [in_path]
+
+    all_data: list[dict] = []
+    all_qa: list[dict] = []
+    all_unmatched: list[dict] = []
+
+    print(f"\nProcessing {len(files)} workbook(s)...")
+    for f in files:
+        try:
+            data, qa, um = process_workbook(f, config, folder_name, box_name)
+        except Exception as e:
+            all_unmatched.append({"File": f.name, "Sheet": "(workbook)", "Reason": f"ERROR: {e!r}"})
+            print(f"  {f.name[:60]:<60}  ERROR {e!r}")
+            continue
+        all_data.extend(data)
+        all_qa.extend(qa)
+        all_unmatched.extend(um)
+        passed = sum(1 for r in qa if r["Overall"] == "PASS")
+        total = len(qa)
+        print(f"  {f.name[:60]:<60}  emp={total:>3}  pass={passed:>3}  unmatched={len(um):>2}")
+
+    total_emp = len(all_qa)
+    total_pass    = sum(1 for r in all_qa if r["Overall"] == "PASS")
+    total_no_grid = sum(1 for r in all_qa if r["Overall"] == "NO_GRID")
+    total_grid    = total_emp - total_no_grid
+    print(f"\n{total_pass}/{total_grid} grid-bearing sheets passed accuracy check.")
+    print(f"{total_no_grid} employee sheet(s) had no time grid (8 blank rows each).")
+    print(f"{len(all_unmatched)} sheet(s) on Unmatched_Sheets tab.\n")
 
     run_info = {
-        "Input File":        excel_name,
-        "Folder Name":       folder_name,
-        "Box Name":          box_name,
-        "Run Timestamp":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Employees Checked": total_employees,
-        "Employees Passed":  pass_count,
-        "Employees Failed":  total_employees - pass_count,
-        "Overall Result":    "PASS" if pass_count == total_employees else "FAIL",
-        "QA Method":         "sum(MON..SUN per column) == Excel grand total (BB24:BG24), tolerance 0.01",
-        "Script Version":    "1.1",
+        "Input":           str(in_path),
+        "Folder Name":     folder_name,
+        "Box Name":        box_name or "(inferred per-file)",
+        "Run Timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Files Processed": len(files),
+        "Sheets Extracted":     total_emp,
+        "Sheets Passed":   total_pass,
+        "Sheets Failed":   total_grid - total_pass,
+        "Sheets No-Grid":  total_no_grid,
+        "Sheets Unmatched": len(all_unmatched),
+        "Sheets Needing Review": sum(1 for r in all_qa if r["Overall"] == "REVIEW"),
+        "Overall Result":  "PASS" if total_pass == total_grid and not all_unmatched else "REVIEW",
+        "Script Version":  "2.1 (Phase 2)",
+        "Config":          str(config_path),
     }
 
-    data_df  = pd.DataFrame(all_rows, columns=OUTPUT_COLUMNS)
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    id_conflicts = check_ee_id_consistency(all_data)
 
-    _write_excel(out_path, data_df, qa_rows, run_info)
-    print(f"Output written to: {out_path}")
-    print("  Sheet 1 — Data       : extracted rows + QA_Flag per row")
-    print("  Sheet 2 — QA_Summary : per-employee accuracy comparison")
-    print("  Sheet 3 — Run_Info   : run metadata and overall result\n")
+    data_df = pd.DataFrame(all_data, columns=output_columns)
+    out_p = Path(out_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    _write_excel(out_p, data_df, all_qa, run_info, all_unmatched, id_conflicts)
+    if id_conflicts:
+        print(f"  ID_Conflicts tab: {len(id_conflicts)} EE-ID conflict(s) found")
+    print(f"Output written to: {out_p}")
+    print("  Sheet 1 — Data             : extracted rows + QA_Flag per row")
+    print("  Sheet 2 — QA_Summary       : per-employee accuracy comparison")
+    print("  Sheet 3 — Run_Info         : run metadata and overall result")
+    print("  Sheet 4 — Unmatched_Sheets : sheets that couldn't be safely extracted")
+    print("  Sheet 5 — ID_Conflicts     : same EE ID mapped to multiple names\n")
 
-    return 0 if pass_count == total_employees else 2
+    return 0 if total_pass == total_grid and not all_unmatched else 2
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract timesheet data from Excel workbook.")
-    parser.add_argument("input", help="Path to input Excel workbook")
+    parser = argparse.ArgumentParser(description="Extract timesheet data from Excel workbook(s).")
+    parser.add_argument("input", help="Path to input .xlsx file or folder of .xlsx files")
     parser.add_argument("--folder", default="2022", help="Folder Name value (default: 2022)")
-    parser.add_argument("--box",    default=None,   help="Box Name value (inferred from filename if omitted)")
+    parser.add_argument("--box",    default=None,   help="Box Name (inferred from filename if omitted)")
     parser.add_argument("--out",    default="output/extracted.xlsx", help="Output Excel path")
+    parser.add_argument("--config", default="config/schema.yaml",    help="Path to config YAML")
     args = parser.parse_args()
-
-    sys.exit(extract(args.input, args.folder, args.box, args.out))
+    sys.exit(extract(args.input, args.folder, args.box, args.out, args.config))
 
 
 if __name__ == "__main__":

@@ -18,3 +18,15 @@ wheels/
 .DS_Store
 Thumbs.db
 ~$*.xlsx
+
+# Claude harness local settings (per-machine; not source)
+.claude/
+
+# Operational data — only the original baseline workbook is tracked
+data/sample/
+data/sample1/
+
+# Outputs — only the latest authoritative output + probe report are tracked
+output/*
+!output/phase2_corpus_v2.xlsx
+!output/probe_report.xlsx

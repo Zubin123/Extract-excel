@@ -1,0 +1,107 @@
+# Timesheet extraction schema.
+#
+# Profiles describe layout variants. Profile selection is automatic via the
+# `detect` block — the first profile whose detect rules match the sheet wins.
+#
+# Anchor row/column positions that are 100% stable across all observed files
+# are fixed here. The pay_totals_row is intentionally NOT fixed — it drifts
+# between rows 13 and 42, and is discovered at runtime by sum cross-check.
+
+profiles:
+  standard:
+    detect:
+      day_label_row: 4
+      day_label_first_col: L     # MON at L4
+
+    day_label_row: 4
+    date_row: 3
+    time_rows:
+      Start:     5
+      Lunch Out: 6
+      Lunch In:  7
+      Stop:      8
+    total_hours_row: 9
+
+    day_blocks:
+      day_labels:     [MON, TUE, WED, THUR, FRI, SAT, SUN]
+      day_start_cols: [L,   R,   X,   AD,   AJ,  AP,  AV]
+      pay_block_width: 6
+      pay_types: [RT, OT, DT, PD, 4D, 4A]
+
+    grand_totals:
+      cols:             [BB, BC, BD, BE, BF, BG]
+      total_hours_col:  BB
+      # row discovered by sum cross-check
+
+    anchors:
+      employee_name: A1
+      ee_id:         B2
+      wc_state:      G13
+      st:            H13
+
+  shifted:
+    # sample1 variant — entire grid shifted one column right
+    detect:
+      day_label_row: 4
+      day_label_first_col: M
+
+    day_label_row: 4
+    date_row: 3
+    time_rows:
+      Start:     5
+      Lunch Out: 6
+      Lunch In:  7
+      Stop:      8
+    total_hours_row: 9
+
+    day_blocks:
+      day_labels:     [MON, TUE, WED, THUR, FRI, SAT, SUN]
+      day_start_cols: [M,   S,   Y,   AE,   AK,  AQ,  AW]
+      pay_block_width: 6
+      pay_types: [RT, OT, DT, PD, 4D, 4A]
+
+    grand_totals:
+      cols:             [BC, BD, BE, BF, BG, BH]
+      total_hours_col:  BC
+
+    anchors:
+      employee_name: A1
+      ee_id:         B2
+      wc_state:      G13     # confirm during Phase 2 run
+      st:            H13
+
+# Output column order — matches Header_Template_New_Rev_1.xlsx header row.
+# Adding a column = adding one entry here.
+output_columns:
+  - Folder Name
+  - Box Name
+  - Excel Name
+  - Sheet Name
+  - Employee Name
+  - EE ID
+  - WC State
+  - ST
+  - Date
+  - Day
+  - Start
+  - Lunch Out
+  - Lunch In
+  - Stop
+  - Total Hours
+  - RT
+  - OT
+  - DT
+  - PD
+  - 4D
+  - 4A
+  - PTO
+  - HP
+  - QA_Flag
+
+defaults:
+  folder: "2022"
+  pto_value: ""
+  hp_value:  ""
+
+# Sum cross-check tolerance for pay_totals_row discovery and accuracy QA.
+tolerance: 0.01
