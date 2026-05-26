@@ -23,6 +23,7 @@ from openpyxl.styles import Font, PatternFill
 from anchors import (
     classify_sheet,
     col_letter_to_index,
+    resolve_anchor_cell,
     resolve_pay_totals_row,
     select_profile,
     sheet_has_day_grid,
@@ -123,14 +124,48 @@ def _row_qa_flag(time_cells: dict, total_hrs, total_hrs_cell: str) -> str:
 
 # ── Sheet extraction ────────────────────────────────────────────────────────
 
+def _anchor_issue(field: str, status: str) -> str | None:
+    if status in ("ok", "noverify"):
+        return None
+    if status.startswith("relocated:"):
+        return f"[CHECK] {field} anchor relocated to {status.split(':', 1)[1]}"
+    if status == "missing":
+        return f"[CHECK] {field} header not found in header_row"
+    return f"[CHECK] {field} anchor unknown status {status!r}"
+
+
 def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
-                  box_name: str, excel_name: str) -> list[dict]:
+                  box_name: str, excel_name: str, kind: str = "employee") -> list[dict]:
     sheet_name = ws.title
     anchors = profile["anchors"]
-    employee_name = ws[anchors["employee_name"]].value or ""
-    ee_id = ws[anchors["ee_id"]].value
-    wc_state = ws[anchors["wc_state"]].value or ""
-    st = ws[anchors["st"]].value or ""
+    raw_a1 = ws[anchors["employee_name"]].value
+    if kind == "employee_alt_layout":
+        ee_id = ws["C2"].value
+    else:
+        ee_id = ws[anchors["ee_id"]].value
+    wc_state_val, wc_status, _ = resolve_anchor_cell(ws, anchors.get("wc_state"))
+    st_val,       st_status, _ = resolve_anchor_cell(ws, anchors.get("st"))
+    wc_state = wc_state_val if wc_state_val is not None else ""
+    st       = st_val       if st_val       is not None else ""
+
+    anchor_issues: list[str] = []
+    if kind == "employee_placeholder":
+        employee_name = ""
+        anchor_issues.append(
+            f"[CHECK] Employee Name placeholder in A1 ({raw_a1!r}) — left blank (no reliable source)"
+        )
+    elif kind == "employee_alt_layout":
+        employee_name = ws["B1"].value or ""
+        anchor_issues.append(
+            f"[CHECK] Alternate layout — Employee Name from B1, EE ID from C2"
+        )
+    else:
+        employee_name = raw_a1 or ""
+
+    for field, status in (("WC State", wc_status), ("ST", st_status)):
+        msg = _anchor_issue(field, status)
+        if msg:
+            anchor_issues.append(msg)
 
     db = profile["day_blocks"]
     day_labels = db["day_labels"]
@@ -218,6 +253,10 @@ def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
     else:
         totals_flag = "OK"
 
+    if anchor_issues:
+        merged = "; ".join(anchor_issues)
+        totals_flag = merged if totals_flag == "OK" else f"{totals_flag}; {merged}"
+
     rows.append({
         "Folder Name":   folder_name,
         "Box Name":      box_name,
@@ -244,14 +283,51 @@ def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
 
 
 def extract_sheet_no_grid(ws, folder_name: str, box_name: str,
-                          excel_name: str) -> list[dict]:
+                          excel_name: str, profile: dict | None = None,
+                          kind: str = "employee") -> list[dict]:
     """Emit 8 blank rows (MON..SUN + TOTALS) for an employee sheet that has
-    no weekly day-label grid (e.g. 'Job' / 'OVERHEAD- CA')."""
+    no weekly day-label grid (e.g. 'Job' / 'OVERHEAD- CA').
+
+    When `profile` is supplied, wc_state/st use the same header-verified
+    resolver as the grid-bearing path; otherwise they fall back to G13/H13.
+    When `kind == "employee_placeholder"`, sheet name is used as the
+    employee name and a [CHECK] flag is emitted on the TOTALS row.
+    """
     sheet_name = ws.title
-    employee_name = ws["A1"].value or ""
-    ee_id = ws["B2"].value
-    wc_state = ws["G13"].value or ""
-    st = ws["H13"].value or ""
+    raw_a1 = ws["A1"].value
+    if kind == "employee_placeholder":
+        employee_name = ""
+    elif kind == "employee_alt_layout":
+        employee_name = ws["B1"].value or ""
+    else:
+        employee_name = raw_a1 or ""
+
+    if kind == "employee_alt_layout":
+        ee_id = ws["C2"].value
+    else:
+        ee_id = ws["B2"].value
+
+    if profile is not None:
+        anchors = profile.get("anchors", {})
+        wc_val, _wc_status, _ = resolve_anchor_cell(ws, anchors.get("wc_state"))
+        st_val, _st_status, _ = resolve_anchor_cell(ws, anchors.get("st"))
+        wc_state = wc_val if wc_val is not None else ""
+        st       = st_val if st_val is not None else ""
+    else:
+        wc_state = ws["G13"].value or ""
+        st = ws["H13"].value or ""
+
+    base_flag = "no time grid"
+    if kind == "employee_placeholder":
+        totals_flag = (
+            f"{base_flag}; [CHECK] Employee Name placeholder in A1 ({raw_a1!r}) — left blank"
+        )
+    elif kind == "employee_alt_layout":
+        totals_flag = (
+            f"{base_flag}; [CHECK] Alternate layout — Employee Name from B1, EE ID from C2"
+        )
+    else:
+        totals_flag = base_flag
 
     rows = []
     for day_label in DEFAULT_DAY_LABELS + ["TOTALS"]:
@@ -274,7 +350,7 @@ def extract_sheet_no_grid(ws, folder_name: str, box_name: str,
             **{pt: "" for pt in DEFAULT_PAY_TYPES},
             "PTO": "",
             "HP":  "",
-            "QA_Flag": "no time grid",
+            "QA_Flag": totals_flag if day_label == "TOTALS" else base_flag,
         }
         rows.append(row)
     return rows
@@ -414,15 +490,28 @@ def process_workbook(input_path: Path, config: dict, folder_name: str,
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
-        kind = classify_sheet(ws, profiles)
-        if kind != "employee":
+        kind, classify_reason = classify_sheet(ws, profiles)
+        if kind == "reference":
+            continue
+        if kind == "unfilled_template":
+            unmatched.append({
+                "File": excel_name, "Sheet": sheet_name,
+                "Reason": f"unfilled employee template: {classify_reason}",
+            })
             continue
 
         # Employee sheets with no weekly grid (e.g. 'Job', 'OVERHEAD- CA') —
         # emit 8 blank rows so the employee is still represented in output.
         if not sheet_has_day_grid(ws, profiles):
-            no_grid_rows = extract_sheet_no_grid(ws, folder_name, box_name, excel_name)
+            ng_profile = next(iter(profiles.values()), None)
+            no_grid_rows = extract_sheet_no_grid(
+                ws, folder_name, box_name, excel_name, ng_profile, kind=kind,
+            )
             data_rows.extend(no_grid_rows)
+            placeholder_issue = (
+                f"[CHECK] Employee Name placeholder — using sheet name {sheet_name!r}"
+                if kind == "employee_placeholder" else ""
+            )
             qa_rows.append({
                 "File":           excel_name,
                 "Employee":       no_grid_rows[0]["Employee Name"],
@@ -431,6 +520,7 @@ def process_workbook(input_path: Path, config: dict, folder_name: str,
                 "Pay Totals Row": "",
                 "QA Method":      "no weekly day-label grid — 8 blank rows emitted",
                 "Tolerance":      tolerance,
+                "Sheet Issues":   placeholder_issue,
                 "Overall":        "NO_GRID",
             })
             continue
@@ -453,7 +543,7 @@ def process_workbook(input_path: Path, config: dict, folder_name: str,
             continue
 
         emp_rows = extract_sheet(ws, profile, pay_totals_row,
-                                 folder_name, box_name, excel_name)
+                                 folder_name, box_name, excel_name, kind=kind)
 
         # Phase 2 sheet-level QA layers
         day_rows = [r for r in emp_rows if r["Day"] != "TOTALS"]
@@ -488,9 +578,17 @@ def process_workbook(input_path: Path, config: dict, folder_name: str,
             qa_row[f"{col}_daily_sum"]   = daily_sum
             qa_row[f"{col}_grand_total"] = grand_total
             qa_row[f"{col}_match"]       = col_status
-        qa_row["Sheet Issues"] = "; ".join(sheet_issues) if sheet_issues else ""
+        totals_qa = str(totals_row.get("QA_Flag", ""))
+        anchor_issue_tokens = [seg.strip() for seg in totals_qa.split(";")
+                               if "[CHECK]" in seg and "anchor" in seg.lower()]
+        all_issues_for_display = sheet_issues + anchor_issue_tokens
+        qa_row["Sheet Issues"] = "; ".join(all_issues_for_display) if all_issues_for_display else ""
         # REVIEW only if there's an actionable [CHECK] or [WARN]; [INFO] alone passes.
-        needs_review = any(("[CHECK]" in s or "[WARN]" in s) for s in sheet_issues)
+        needs_review = (
+            any(("[CHECK]" in s or "[WARN]" in s) for s in sheet_issues)
+            or "[CHECK]" in totals_qa
+            or "[WARN]" in totals_qa
+        )
         qa_row["Overall"] = "PASS" if (passed and not needs_review) else ("REVIEW" if passed else "FAIL")
         qa_rows.append(qa_row)
 

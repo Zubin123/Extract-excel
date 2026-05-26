@@ -56,6 +56,96 @@ def find_day_label_row(ws, max_scan_row: int = 20) -> tuple[int, int] | None:
     return None
 
 
+def resolve_anchor_cell(ws, spec, search_cols: int = 14,
+                        row_scan_radius: int = 1, data_scan_depth: int = 5
+                        ) -> tuple[object, str, str]:
+    """Read an anchor cell, verifying its column against a header label.
+
+    `spec` is either a plain cell address like 'G13' (no verification) or a
+    dict with keys: cell, header_row, header_label.
+
+    For the dict form, the column letter of `cell` is the *expected* location
+    and the row digit is the *expected* data row. The resolver:
+      1. Searches header_row ± row_scan_radius for the header label (handles
+         OVERHEAD-style sheets where the header sits one row above/below).
+      2. Inside the matching header row, finds the column whose cell equals
+         the label.
+      3. Scans the column downward from header_row+1 for up to
+         data_scan_depth rows to find the first non-empty cell (handles
+         Ibarra-style sheets where the data sits two rows below the header).
+
+    Returns (value, status, source_addr) where status is one of:
+      "ok"                — header at expected row+col, value at expected row
+      "relocated:<addr>"  — header or data found at a different position
+      "missing"           — label not found anywhere within scan range
+      "noverify"          — spec was a plain string; no header check
+    """
+    if isinstance(spec, str):
+        return ws[spec].value, "noverify", spec
+
+    if not isinstance(spec, dict) or "cell" not in spec:
+        return None, "missing", ""
+
+    cell_addr = spec["cell"]
+    expected_header_row = spec.get("header_row")
+    header_label = spec.get("header_label")
+    if expected_header_row is None or header_label is None:
+        return ws[cell_addr].value, "noverify", cell_addr
+
+    # Split cell_addr (e.g. 'G13' -> 'G', 13)
+    col_letters = "".join(ch for ch in cell_addr if ch.isalpha())
+    row_digits = "".join(ch for ch in cell_addr if ch.isdigit())
+    expected_col_idx = col_letter_to_index(col_letters)
+    expected_data_row = int(row_digits)
+    label_upper = str(header_label).strip().upper()
+
+    def _norm(v):
+        return v.strip().upper() if isinstance(v, str) else None
+
+    def _first_non_empty(col_idx, start_row, depth):
+        for r in range(start_row, start_row + depth):
+            v = ws.cell(row=r, column=col_idx).value
+            if v is not None and not (isinstance(v, str) and v.strip() == ""):
+                return r, v
+        return None, None
+
+    # Build list of header rows to try: expected first, then ±1, ±2, ...
+    rows_to_try = [expected_header_row]
+    for delta in range(1, row_scan_radius + 1):
+        rows_to_try.extend([expected_header_row - delta, expected_header_row + delta])
+    rows_to_try = [r for r in rows_to_try if r >= 1]
+
+    max_c = min(ws.max_column or 0, search_cols)
+
+    for hr in rows_to_try:
+        # First check the expected column at this header row
+        if _norm(ws.cell(row=hr, column=expected_col_idx).value) == label_upper:
+            found_col = expected_col_idx
+        else:
+            # Scan the row for the label in any other column
+            found_col = None
+            for c in range(1, max_c + 1):
+                if _norm(ws.cell(row=hr, column=c).value) == label_upper:
+                    found_col = c
+                    break
+        if found_col is None:
+            continue
+
+        # Header found at (hr, found_col). Now find first non-empty data row.
+        data_row_used, value = _first_non_empty(found_col, hr + 1, data_scan_depth)
+        if data_row_used is None:
+            # Header present but column completely empty within scan depth.
+            value = None
+            data_row_used = hr + 1
+
+        relocated_addr = f"{col_index_to_letter(found_col)}{data_row_used}"
+        if hr == expected_header_row and found_col == expected_col_idx and data_row_used == expected_data_row:
+            return value, "ok", cell_addr
+        return value, f"relocated:{relocated_addr}", relocated_addr
+
+    return None, "missing", ""
+
+
 def looks_like_person_name(v) -> bool:
     """Heuristic: 'Last; First M' or 'Last, First M'."""
     if not isinstance(v, str):
@@ -70,21 +160,79 @@ def looks_like_person_name(v) -> bool:
     return False
 
 
-def classify_sheet(ws, profiles: dict) -> str:
-    """Return one of: 'employee', 'reference'.
+EMPLOYEE_NAME_PLACEHOLDERS = {"INPUT EMPLOYEE NUMBER"}
 
-    A sheet is an employee sheet iff A1 looks like a person name AND B2 is an
-    integer ID. The presence of a weekly day-label grid is NOT required —
-    sheets like 'Job' / 'OVERHEAD- CA' that name an employee but carry no
-    weekly time grid are still employee sheets (they just produce blank rows).
+
+def _b2_is_int_ee_id(b2) -> bool:
+    if isinstance(b2, bool):
+        return False
+    if isinstance(b2, int):
+        return True
+    if isinstance(b2, float) and b2.is_integer():
+        return True
+    return False
+
+
+def classify_sheet(ws, profiles: dict) -> tuple[str, str]:
+    """Return (kind, reason). kind is one of:
+
+    - 'employee'             : A1 is a person name AND B2 is an int EE ID
+                               → extract normally
+    - 'employee_placeholder' : B2 is an int EE ID but A1 is a template
+                               placeholder (or empty) → extract; leave
+                               Employee Name blank (sheet name is not the
+                               real employee name)
+    - 'employee_alt_layout'  : A1 is empty but B1 is a person name AND C2
+                               is an int EE ID (Hall-style OVERHEAD sheets
+                               where the template uses B1/C2 instead of
+                               A1/B2)
+    - 'unfilled_template'    : sheet has employee-template shape but neither
+                               name nor ID was filled in → log to
+                               Unmatched_Sheets so it's visible
+    - 'reference'            : structural reference sheet (Job List,
+                               Equipment, ColumnLists, etc.) → silent skip
     """
     a1 = ws["A1"].value
-    if not looks_like_person_name(a1):
-        return "reference"
+    b1 = ws["B1"].value
     b2 = ws["B2"].value
-    if not isinstance(b2, int) and not (isinstance(b2, float) and b2.is_integer()):
-        return "reference"
-    return "employee"
+    c2 = ws["C2"].value
+    a1_str = a1.strip() if isinstance(a1, str) else ""
+    a1_upper = a1_str.upper()
+    b2_str = b2.strip() if isinstance(b2, str) else ""
+    b2_upper = b2_str.upper()
+
+    if looks_like_person_name(a1) and _b2_is_int_ee_id(b2):
+        return "employee", ""
+
+    # Hall-style alternate layout: name in B1, EE ID in C2, A1 empty.
+    if (a1 is None or a1_str == "") and looks_like_person_name(b1) and _b2_is_int_ee_id(c2):
+        return "employee_alt_layout", (
+            f"Hall-style layout: name at B1 ({b1!r}), EE ID at C2 ({c2})"
+        )
+
+    # Has a real EE ID but A1 is empty / template placeholder → recoverable.
+    # Don't use sheet name as fallback — it isn't the employee name. Leave blank.
+    if _b2_is_int_ee_id(b2) and (
+        a1 is None
+        or a1_upper in EMPLOYEE_NAME_PLACEHOLDERS
+        or a1_upper.startswith("INPUT ")
+    ):
+        return "employee_placeholder", (
+            f"A1 placeholder ({a1!r}) — Employee Name left blank"
+        )
+
+    # Looks like an unfilled employee template (B2 carries the 'EE: # ' literal —
+    # placeholder syntax with ':' or '#' — not a bare header label like 'EE ID').
+    if a1 is None and isinstance(b2, str) and (":" in b2 or "#" in b2) and b2_upper.startswith("EE"):
+        return "unfilled_template", (
+            f"A1=None, B2={b2!r} — employee template never filled in"
+        )
+    if a1_upper.startswith("INPUT ") and b2 is None:
+        return "unfilled_template", (
+            f"A1={a1!r}, B2=None — employee template never filled in"
+        )
+
+    return "reference", ""
 
 
 def sheet_has_day_grid(ws, profiles: dict) -> bool:

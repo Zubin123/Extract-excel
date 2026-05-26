@@ -36,8 +36,14 @@ profiles:
     anchors:
       employee_name: A1
       ee_id:         B2
-      wc_state:      G13
-      st:            H13
+      wc_state:
+        cell:         G13
+        header_row:   12
+        header_label: WC STATE
+      st:
+        cell:         H13
+        header_row:   12
+        header_label: ST
 
   shifted:
     # sample1 variant — entire grid shifted one column right
@@ -67,8 +73,14 @@ profiles:
     anchors:
       employee_name: A1
       ee_id:         B2
-      wc_state:      G13     # confirm during Phase 2 run
-      st:            H13
+      wc_state:
+        cell:         G13
+        header_row:   12
+        header_label: WC STATE
+      st:
+        cell:         H13
+        header_row:   12
+        header_label: ST
 
 # Output column order — matches Header_Template_New_Rev_1.xlsx header row.
 # Adding a column = adding one entry here.
