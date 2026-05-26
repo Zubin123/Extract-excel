@@ -1,43 +1,46 @@
 # Excel Timesheet Extractor
 
-Deterministic Python script that converts weekly-timesheet Excel workbooks into a flat, audited tabular output.
+Deterministic Python pipeline that converts weekly-timesheet Excel workbooks into a flat, audited tabular output with layered QA and header-verified field anchors.
 
 ## Quick start
 
-```bash
+```powershell
 # Install uv first: https://docs.astral.sh/uv/
 
 uv sync
-uv run python src/extract.py "data/WE 01 08 22 CA GF'S - WA 4939-0899-6263_1.xlsx"
-uv run pytest tests/ -v
+
+# Run on a folder of workbooks
+.venv\Scripts\python.exe src\extract.py data\ --out output\run.xlsx
+
+# Or a single file
+.venv\Scripts\python.exe src\extract.py "data\WE 01 08 22 CA GF'S - WA 4939-0899-6263_1.xlsx"
 ```
 
-Expected: `10/10 employees passed accuracy check`, all 19 tests green.
+## Output (5 tabs)
 
-## Output
-
-Three-sheet Excel at `output/extracted.xlsx`:
-
-1. **`Data`** — 80 rows (10 employees × 7 day rows + 1 TOTALS row), with a `QA_Flag` column flagging any source-data issues per row.
-2. **`QA_Summary`** — per-employee comparison: `daily_sum` vs `grand_total` vs `match` for every pay type and Total Hours. Colour-coded (green = MATCH, yellow = SKIPPED, red = MISMATCH).
-3. **`Run_Info`** — run metadata.
+| Tab | What's in it |
+|---|---|
+| `Data` | Row-per-day per employee + TOTALS row, with QA_Flag column |
+| `QA_Summary` | Per-employee pay-type accuracy comparison + `Overall` status (PASS / REVIEW / FAIL / NO_GRID) + Sheet Issues column |
+| `Run_Info` | Run metadata, totals, overall result |
+| `Unmatched_Sheets` | Sheets the pipeline refused to extract, with reason |
+| `ID_Conflicts` | Same EE ID → multiple names within one workbook |
 
 ## Documentation
 
-- [CLAUDE.md](CLAUDE.md) — original verified spec (cell coordinates, sheet layout)
-- [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) — design decisions, "where it can break", state of the project
-- [PLAN.md](PLAN.md) — what's next (batch mode for 5,000+ files, pipeline options)
+- [CLAUDE.md](CLAUDE.md) — **source of truth.** Layout reference, classifier behaviour, header-verified anchors, outstanding work, session-continuity notes
+- [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) — design decisions, "where it can break"
+- [PLAN.md](PLAN.md) — phase status and roadmap
 
-## How the accuracy check works
+## How extraction stays correct under template drift
 
-The script cross-checks **its own extracted values** against **Excel's own pre-computed formula totals**:
+The pipeline uses **header-verified anchors** instead of fixed cell positions for free-floating fields:
 
-| Column | Daily source | Grand-total source |
-|---|---|---|
-| RT, OT, DT, PD, 4D, 4A | Row 24, cols L–BA | Row 24, cols BB–BG |
-| Total Hours | Row 9, day-block start cols | Cell `BB9` |
+- `resolve_anchor_cell` finds each field by reading its header label, then walks downward for the first non-empty data cell
+- Handles column drift (FSL inserted before WC STATE), header-row drift (row 11 vs row 12), and data-row drift (data at row 15 vs row 13)
+- Any layout fallback emits a `[CHECK]` flag — silent misreads are structurally impossible for header-verified fields
 
-Tolerance: `0.01`. If the sum of 7 extracted day values matches Excel's pre-computed grand total, the extraction is verified for that column.
+Pay-type hours (RT/OT/DT/PD/4D/4A) are still verified by sum cross-check: `sum(MON..SUN per pay type)` must equal the grand-total cell. Tolerance: 0.01. See [CLAUDE.md](CLAUDE.md) §6 for full details.
 
 ## Stack
 

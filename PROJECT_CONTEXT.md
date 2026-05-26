@@ -16,13 +16,15 @@ No AI / LLM at runtime. All cell coordinates are fixed and known (see [CLAUDE.md
 
 ---
 
-## 2. Current state (as of last commit)
+## 2. Current state (as of commit 64367e3, Phase 3 complete)
 
-- **All 19 tests pass** (`uv run pytest`)
-- **10/10 employees pass accuracy check** on the sample input file
-- Output Excel at [output/extracted.xlsx](output/extracted.xlsx) reflects the latest run
-- Input sample at [data/WE 01 08 22 CA GF'S - WA 4939-0899-6263_1.xlsx](data/)
-- Template at [data/Header Template New_Rev 1.xlsx](data/)
+- **Working directory:** `C:\dev\Extract-excel` (moved off OneDrive — OneDrive corrupts git pack files)
+- **Corpus state:** 425 PASS / 35 REVIEW / 29 NO_GRID / 41 Unmatched across 40 workbooks (487 employee/sheet entries)
+- **All 208 user-feedback annotations resolved** (72 WC State, 64 ST, 56 Employee Name, 16 Hall) — see [CLAUDE.md](CLAUDE.md) §5
+- **Header-verified anchor system** (`resolve_anchor_cell` in `src/anchors.py`) — handles column drift, header-row drift, data-row drift
+- **Expanded classifier** with 4 kinds (`employee`, `employee_placeholder`, `employee_alt_layout`, `unfilled_template`) — see [CLAUDE.md](CLAUDE.md) §6.2
+- Latest output: `output/phase2_corpus_v4.xlsx` (local-only, gitignored)
+- Template at [data/Header Template New_Rev 1.xlsx](data/) (read-only reference)
 
 ---
 

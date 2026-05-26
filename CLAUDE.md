@@ -125,19 +125,27 @@ Severity legend in QA_Flag strings:
 
 ---
 
-## 5. Latest results (40-workbook corpus)
+## 5. Latest results (40-workbook corpus, after Phase 3 layout-drift fixes — commit 64367e3)
 
 | Status | Count | Notes |
 |---|---|---|
-| PASS | **438** | grid-bearing sheets, all numbers verified |
-| REVIEW | 0 | clean after Phase 2 noise cleanup (see §7) |
-| NO_GRID | 23 | employee sheets without weekly time grid |
-| Unmatched | 0 | nothing fell through |
-| **Total output rows** | **~3,690** | 461 employees × 8 rows |
+| PASS | **425** | grid-bearing sheets, all numbers verified, no `[CHECK]` flags |
+| REVIEW | **35** | extracted correctly but flagged — 13 anchor relocations + 22 name placeholders |
+| NO_GRID | **29** | sheets with no weekly grid (includes 4 Hall OVERHEAD-CA sheets now extracted via alt-layout) |
+| Unmatched | **41** | unfilled template sheets — visible on Unmatched_Sheets, no longer silently dropped |
+| **Total output rows** | **~3,896** | 487 employee/sheet entries × 8 rows |
 
-Authoritative output: [output/phase2_corpus_v2.xlsx](output/phase2_corpus_v2.xlsx).
+Authoritative output: `output/phase2_corpus_v4.xlsx` (local-only, gitignored).
 
-`Case TUE RT = 8.0` and `Case TOTALS RT = 32.0` ✓ (original spec checks pass).
+**Important:** Previous v2 baseline (438/438 PASS) was *silently wrong* on 13 sheets — WC State read `'N'` from the FSL column in WE 12 25 21 6818 because anchors were positional-only. Header-verified anchors (§6) caught and fixed this. After Phase 3, zero rows of fabricated/misread data remain.
+
+`Case TUE RT = 8.0` and `Case TOTALS RT = 32.0` ✓ (original spec checks still pass).
+
+All 208 annotations in user feedback file `phase2_corpus_v3 - Feedback.xlsx` were resolved:
+- 72 WC State missing → fixed (header-verified resolver finds the actual cell)
+- 64 ST missing → fixed (same resolver)
+- 56 Employee Name wrongly populated from sheet name → fixed (now blank with `[CHECK]` flag)
+- 16 Hall OVERHEAD-CA all-fields missing → fixed (new `employee_alt_layout` classifier reads B1/C2)
 
 ---
 
@@ -153,10 +161,45 @@ Authoritative output: [output/phase2_corpus_v2.xlsx](output/phase2_corpus_v2.xls
   23, 24, 25, 28, 29, 30, 32, 33, 34, 37, 40, 41, 42)
 - Column profile: `standard` (MON at L) covers 464 sheets; `shifted` (MON at
   M) covers 13 sheets
+- **WC State / ST column positions** drift across templates (see §6.1)
+- **Sheet header layout** varies (A1/B2 standard vs B1/C2 Hall-style — see §6.2)
 
-Reference sheets (auto-rejected by structural classifier, no name list):
-`Job List`, `Equipment`, `Employees`, `Template`, `ColumnLists`, plus any
-sheet where `A1` isn't a person name or `B2` isn't an int.
+### 6.1 Header-verified anchors (Phase 3)
+
+`resolve_anchor_cell` in `src/anchors.py` finds fields by **header label**, not by fixed cell position:
+
+1. Reads the configured `header_row` ± 1 looking for the `header_label` text (case-insensitive)
+2. Once found, scans downward up to 5 rows for the first non-empty cell
+3. Returns `(value, status, addr)` where status is `"ok"`, `"relocated:<addr>"`, `"missing"`, or `"noverify"`
+
+The config YAML (`config/schema.yaml`) declares anchors like:
+```yaml
+wc_state:
+  cell: G13                # expected location (fallback)
+  header_row: 12           # where to find the label
+  header_label: WC STATE   # text to match
+```
+
+This handles three real-world drifts seen in the corpus:
+- **Column drift** — FSL inserted before WC STATE shifts the column from G to H (WE 12 25 21 6818, 13 sheets)
+- **Header row drift** — OVERHEAD-CA style sheets have headers at row 11 instead of 12 (Hall + single-employee Job/OVERHEAD sheets, ~14 sheets)
+- **Data row drift** — Ibarra/Schnider OH have header at row 12 but the value sits at row 15 (~6 sheets)
+
+Any time the resolver falls back, a `[CHECK]` flag is emitted on the TOTALS row's QA_Flag and the sheet's QA_Summary Overall becomes `REVIEW`.
+
+### 6.2 Sheet classifier categories (Phase 3)
+
+`classify_sheet` returns `(kind, reason)`. Each kind routes through a different extract path:
+
+| kind | Detection | Where it goes |
+|---|---|---|
+| `employee` | `A1` is a person name AND `B2` is an int EE ID | normal extraction |
+| `employee_placeholder` | `B2` is an int EE ID but `A1` is `"Input Employee Number"` or empty | extracted; Employee Name left blank with `[CHECK]` flag |
+| `employee_alt_layout` | `A1` is empty AND `B1` is a person name AND `C2` is an int EE ID (Hall-style template) | extracted using B1 for name, C2 for EE ID |
+| `unfilled_template` | `B2` carries `'EE: # '` template literal AND `A1` is None | logged to Unmatched_Sheets with reason |
+| `reference` | anything else (Job List, Equipment, ColumnLists, etc.) | silently skipped |
+
+The classifier does NOT use a hardcoded list of reference-sheet names — it's purely structural.
 
 ---
 
@@ -214,22 +257,38 @@ Run `python src/probe.py` first to confirm the new column letters.
 
 ## 9. Outstanding work / known limitations
 
-1. **`Hall` / `Smith, Dustin` files extract `emp=0`.** Their JOB / OVERHEAD-CA
-   sheets have `A1=None` and `B2='EE: # '` (template placeholder). Would need
-   filename-based employee inference. Not yet implemented.
+### Resolved in Phase 3 (commit 64367e3)
+- ✅ **Hall files extract `emp=0`** — fixed via `employee_alt_layout` classifier; B1 holds the name, C2 holds the EE ID
+- ✅ **Silent skip of sheets with `A1='Input Employee Number'`** — fixed via `employee_placeholder` classifier (Delgado/Griego/Nunez/McDonald/Benedict/Rivera/Hanson now extract correctly)
+- ✅ **WC State read from FSL column on WE 12 25 21 6818** — fixed via header-verified `resolve_anchor_cell` (was 104 silently wrong rows, now 0)
+- ✅ **Unmatched_Sheets visibility** — sheets previously dropped silently are now logged with reasons
 
-2. **No parallelization.** Single-process; 5,000 files take ~4h sequential.
+### Still open
+1. **No parallelization.** Single-process; 5,000 files take ~4h sequential.
    Adding `multiprocessing.Pool` over workbooks is a 1-day task for ~10× speedup.
 
-3. **Single large output workbook.** At 5,000 files, the output `.xlsx` is
+2. **Single large output workbook.** At 5,000 files, the output `.xlsx` is
    too large for Excel. Switch to CSV/Parquet output for large runs.
 
-4. **No incremental processing.** Reruns re-extract everything. Adding
+3. **No incremental processing.** Reruns re-extract everything. Adding
    filename+mtime hashing to skip unchanged files is straightforward.
 
-5. **Operator's guide doesn't exist yet.** Non-engineers running at scale
+4. **Operator's guide doesn't exist yet.** Non-engineers running at scale
    need a one-page README of "run this command, look at these tabs, do X when
    Y is flagged."
+
+5. **Other free-floating field anchors still positional.** Header verification
+   is currently applied only to `wc_state` and `st`. The same pattern should
+   be extended to `employee_name`, `ee_id`, date row, time rows, and pay-type
+   column order to close the entire "silent position drift" failure class.
+   See conversation thread on residual risks for details. ~1 day of work.
+
+6. **Hall ST value depends on header presence in row 11.** The Hall template
+   has WC STATE at L11 but no ST header. ST currently resolves to whatever
+   the resolver finds when scanning H12 ± 1 — which happens to be 'CA' in
+   the corpus. If a Hall file ever has a different ST value, we'd miss it.
+   Roster lookup via the workbook's Employees sheet (EE 4876 → ST='CA') would
+   be the robust fix.
 
 ---
 
@@ -263,21 +322,33 @@ Run `python src/probe.py` first to confirm the new column letters.
   ID, the sheet must produce 8 output rows even if the employee had zero
   hours that week.
 - **Reference sheets are detected structurally, not by name list.**
+- **When adding a new field anchor, use `resolve_anchor_cell` with a header label** — don't read fixed cells like `G13` directly. Add `cell` + `header_row` + `header_label` to the YAML profile.
+- **`employee_placeholder` sheets must leave Employee Name blank** — never use the sheet tab name as a fallback. The sheet name isn't reliably the employee's real name.
 
 ---
 
 ## 12. Session continuity for Claude
 
+**Working directory:** `C:\dev\Extract-excel` (NOT the OneDrive folder — OneDrive corrupts git pack files; project was moved here in Phase 3).
+
 When resuming on a new machine, in priority order:
 
-1. Read this file (§4–§11 especially).
-2. Inspect [output/phase2_corpus_v2.xlsx](output/phase2_corpus_v2.xlsx)
-   Run_Info tab — that's the latest run's metadata.
-3. Inspect [output/probe_report.xlsx](output/probe_report.xlsx) for the
-   structural patterns observed in the corpus.
-4. Read `src/anchors.py` (the key technical artifact) and `src/qa.py`.
-5. Skim `config/schema.yaml` — all profile/column declarations live there;
-   the Python code is driven from it.
+1. Read this file (§4–§11 especially). The Phase 3 changes in §5, §6.1, §6.2, §9 are the most recent.
+2. Inspect `output/phase2_corpus_v4.xlsx` Run_Info tab — that's the latest run's metadata (local-only, gitignored).
+3. Inspect `output/probe_report.xlsx` for the structural patterns observed in the corpus.
+4. Read `src/anchors.py` (the key technical artifact — `resolve_anchor_cell` and `classify_sheet` are the two most important functions) and `src/qa.py`.
+5. Skim `config/schema.yaml` — all profile/column declarations live there; the Python code is driven from it. Anchors now use `{cell, header_row, header_label}` dict form for wc_state and st.
+
+**Git state at last update:**
+- Branch: `main`
+- HEAD: `64367e3` "Fix layout-drift bugs: header-verified anchors + Hall alt-layout + placeholder handling"
+- Remote: https://github.com/Zubin123/Extract-excel.git
+
+**Conversation history that shaped Phase 3:**
+- User reported 6 specific claims about missing/wrong extractions in early WE 12 18 21 + WE 12 25 21 corpus
+- Investigation found root causes were positional anchors (G13/H13 hardcoded), placeholder sheets being silently dropped, and Hall files using a different template (B1/C2 instead of A1/B2)
+- Fix was header-verified `resolve_anchor_cell` + expanded classifier (4 kinds instead of 2)
+- All 6 claims and all 208 feedback-file annotations were resolved (verified via `scripts/validate_against_feedback.py`)
 
 Git history has the chronological story: Phase 1 (anchor-based extraction),
 Phase 2 (layered QA), Phase 2 v2 (noise cleanup — `[INFO]` downgrades,

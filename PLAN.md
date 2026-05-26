@@ -5,8 +5,10 @@
 | Phase | State | Notes |
 |---|---|---|
 | 1. Single-file extraction + QA + tests | **DONE** | 19/19 tests passing, 10/10 employees pass accuracy |
-| 2. Batch mode (folder → combined output) | TODO | Multiprocessing, one combined Excel + one combined QA |
-| 3. Pipeline / scheduling | TODO (decision pending) | See Section 3 for options |
+| 2. Batch mode + layered QA | **DONE** | Folder-walking CLI, 5-tab output, layered QA flags |
+| 3. Layout-drift fixes (header-verified anchors) | **DONE** | Commit `64367e3`. 208/208 feedback issues resolved. See [CLAUDE.md](CLAUDE.md) §5–§6 for details. |
+| 4. Parallelization | TODO | `multiprocessing.Pool` for ~10× speedup on 5,000-file batches |
+| 5. Pipeline / scheduling | TODO (decision pending) | See Section 3 for options |
 
 ---
 
