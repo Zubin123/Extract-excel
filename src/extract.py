@@ -124,7 +124,15 @@ def _row_qa_flag(time_cells: dict, total_hrs, total_hrs_cell: str) -> str:
 
 # ── Sheet extraction ────────────────────────────────────────────────────────
 
-def _anchor_issue(field: str, status: str) -> str | None:
+def _anchor_issue(field: str, status: str, value=None) -> str | None:
+    # Empty / missing value check — independent of header-resolution status.
+    is_empty = value is None or (isinstance(value, str) and value.strip() == "")
+    if is_empty:
+        if status == "missing":
+            return f"[CHECK] {field} empty — header not found in header_row"
+        if status.startswith("relocated:"):
+            return f"[CHECK] {field} empty — header relocated to {status.split(':', 1)[1]} but no value"
+        return f"[CHECK] {field} empty — no value in source cell"
     if status in ("ok", "noverify"):
         return None
     if status.startswith("relocated:"):
@@ -162,8 +170,11 @@ def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
     else:
         employee_name = raw_a1 or ""
 
-    for field, status in (("WC State", wc_status), ("ST", st_status)):
-        msg = _anchor_issue(field, status)
+    for field, status, value in (
+        ("WC State", wc_status, wc_state_val),
+        ("ST",       st_status, st_val),
+    ):
+        msg = _anchor_issue(field, status, value)
         if msg:
             anchor_issues.append(msg)
 
@@ -595,6 +606,82 @@ def process_workbook(input_path: Path, config: dict, folder_name: str,
     return data_rows, qa_rows, unmatched
 
 
+def _employee_has_no_activity(emp_rows: list[dict], pay_types: list[str]) -> bool:
+    """True iff this employee should be dropped from output.
+
+    Drop criteria (BOTH must hold):
+      1. Grand TOTALS row 'Total Hours' is 0 / None / blank / '0.00'
+      2. No day row has any time-of-day entry (Start/Lunch Out/Lunch In/Stop)
+
+    Pay-type cells are intentionally NOT consulted — HP-PTO / OT-only
+    accounting sheets show pay-type totals without representing worked
+    hours. The user's rule is "didn't work even for a single day".
+    """
+    def _is_zero_or_blank(v):
+        if v is None:
+            return True
+        if isinstance(v, bool):
+            return False
+        if isinstance(v, (int, float)):
+            return v == 0
+        if isinstance(v, str):
+            s = v.strip()
+            if s == "":
+                return True
+            try:
+                return float(s) == 0
+            except ValueError:
+                return False
+        return False
+
+    day_rows = [r for r in emp_rows if r["Day"] != "TOTALS"]
+    totals_row = next((r for r in emp_rows if r["Day"] == "TOTALS"), None)
+
+    if not day_rows and totals_row is None:
+        return True
+    if totals_row is None:
+        return False
+
+    if not _is_zero_or_blank(totals_row.get("Total Hours")):
+        return False
+
+    for r in day_rows:
+        for k in ("Start", "Lunch Out", "Lunch In", "Stop"):
+            v = r.get(k)
+            if v not in (None, "", 0):
+                return False
+    return True
+
+
+def _drop_empty_employees(all_data: list[dict], all_qa: list[dict],
+                          pay_types: list[str]) -> tuple[list[dict], list[dict], int]:
+    """Drop any employee (grid-bearing or NO_GRID) with zero activity.
+
+    'Zero activity' means: every day row has Total Hours = 0/None/'0.00'
+    AND every pay-type cell is 0/blank AND every time-of-day cell is blank.
+    NO_GRID employees that we can't currently extract real data for are
+    included in this filter — empty rows in the output are not real data.
+    """
+    by_key: dict[tuple, list[dict]] = {}
+    order: list[tuple] = []
+    for r in all_data:
+        k = (r["Excel Name"], r["Sheet Name"])
+        if k not in by_key:
+            by_key[k] = []
+            order.append(k)
+        by_key[k].append(r)
+
+    keep_keys = set()
+    for k in order:
+        if not _employee_has_no_activity(by_key[k], pay_types):
+            keep_keys.add(k)
+
+    new_data = [r for r in all_data if (r["Excel Name"], r["Sheet Name"]) in keep_keys]
+    new_qa   = [q for q in all_qa   if (q["File"],       q["Sheet Name"])  in keep_keys]
+    dropped  = len(order) - len(keep_keys)
+    return new_data, new_qa, dropped
+
+
 def extract(input_arg: str, folder_name: str, box_name: str | None, out_path: str,
             config_path: str) -> int:
     config = load_config(Path(config_path))
@@ -626,6 +713,13 @@ def extract(input_arg: str, folder_name: str, box_name: str | None, out_path: st
         total = len(qa)
         print(f"  {f.name[:60]:<60}  emp={total:>3}  pass={passed:>3}  unmatched={len(um):>2}")
 
+    pay_types_for_filter = config["profiles"]["standard"]["day_blocks"]["pay_types"]
+    all_data, all_qa, dropped_empty = _drop_empty_employees(
+        all_data, all_qa, pay_types_for_filter
+    )
+    if dropped_empty:
+        print(f"Dropped {dropped_empty} employee sheet(s) with zero activity (no hours, no time entries).")
+
     total_emp = len(all_qa)
     total_pass    = sum(1 for r in all_qa if r["Overall"] == "PASS")
     total_no_grid = sum(1 for r in all_qa if r["Overall"] == "NO_GRID")
@@ -645,6 +739,7 @@ def extract(input_arg: str, folder_name: str, box_name: str | None, out_path: st
         "Sheets Failed":   total_grid - total_pass,
         "Sheets No-Grid":  total_no_grid,
         "Sheets Unmatched": len(all_unmatched),
+        "Sheets Dropped (empty)": dropped_empty,
         "Sheets Needing Review": sum(1 for r in all_qa if r["Overall"] == "REVIEW"),
         "Overall Result":  "PASS" if total_pass == total_grid and not all_unmatched else "REVIEW",
         "Script Version":  "2.1 (Phase 2)",

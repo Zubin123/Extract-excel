@@ -30,3 +30,6 @@ data/sample1/
 output/*
 !output/phase2_corpus_v2.xlsx
 !output/probe_report.xlsx
+
+# Feedback workbooks — user/manager annotation files (data artifacts, ship via OneDrive)
+*Feedback.xlsx
