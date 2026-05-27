@@ -125,27 +125,38 @@ Severity legend in QA_Flag strings:
 
 ---
 
-## 5. Latest results (40-workbook corpus, after Phase 3 layout-drift fixes — commit 64367e3)
+## 5. Latest results & current state (as of 2026-05-27, label-driven Phase 4 in progress)
 
-| Status | Count | Notes |
-|---|---|---|
-| PASS | **425** | grid-bearing sheets, all numbers verified, no `[CHECK]` flags |
-| REVIEW | **35** | extracted correctly but flagged — 13 anchor relocations + 22 name placeholders |
-| NO_GRID | **29** | sheets with no weekly grid (includes 4 Hall OVERHEAD-CA sheets now extracted via alt-layout) |
-| Unmatched | **41** | unfilled template sheets — visible on Unmatched_Sheets, no longer silently dropped |
-| **Total output rows** | **~3,896** | 487 employee/sheet entries × 8 rows |
+**Guiding principle (carry forward):** extract every output field by **finding its
+label**, regardless of template family. Do not branch logic on "is this Field
+Mechanic vs standard." If a field's label is present → extract it; if absent →
+leave blank + emit a `[CHECK]` flag. Only hardcode logic that is a 100%
+structural guarantee (the arithmetic sum-cross-check; invariants confirmed
+across the whole corpus). Never emit a guessed value.
 
 Authoritative output: `output/phase2_corpus_v4.xlsx` (local-only, gitignored).
 
-**Important:** Previous v2 baseline (438/438 PASS) was *silently wrong* on 13 sheets — WC State read `'N'` from the FSL column in WE 12 25 21 6818 because anchors were positional-only. Header-verified anchors (§6) caught and fixed this. After Phase 3, zero rows of fabricated/misread data remain.
+### Current v4 result (after the empty-employee drop filter, commit a90cd9c)
+| Status | Count | Notes |
+|---|---|---|
+| PASS | ~251 | grid-bearing, pay-type sums verified, no `[CHECK]` |
+| REVIEW | ~20 | extracted correctly but flagged |
+| Dropped (empty) | 218 | zero-activity employees removed from output |
+| Unmatched | 41 | unfilled templates — visible, not silently dropped |
+| **In progress** | 29 Field Mechanic sheets | real timesheets, a 3rd family — see §6.3 |
 
-`Case TUE RT = 8.0` and `Case TOTALS RT = 32.0` ✓ (original spec checks still pass).
+The 271 sheets currently in v4 are independently audited correct
+(`scripts/audit_v4.py`): pay-type grand totals 271/271, WC State 271/271, ST
+271/271, Total Hours effectively 271/271 (64 are `#VALUE!` in source, recovered
+by summing day rows).
 
-All 208 annotations in user feedback file `phase2_corpus_v3 - Feedback.xlsx` were resolved:
-- 72 WC State missing → fixed (header-verified resolver finds the actual cell)
-- 64 ST missing → fixed (same resolver)
-- 56 Employee Name wrongly populated from sheet name → fixed (now blank with `[CHECK]` flag)
-- 16 Hall OVERHEAD-CA all-fields missing → fixed (new `employee_alt_layout` classifier reads B1/C2)
+**History that shaped this:** the v2 baseline (438/438 PASS) was *silently wrong*
+on 13 sheets — WC State read `'N'` from the FSL column in WE 12 25 21 6818
+because anchors were positional. Header-verified anchors (§6.1) fixed that.
+All 208 annotations in `phase2_corpus_v3 - Feedback.xlsx` were resolved
+(WC State / ST missing → header resolver; Employee Name from sheet-name → now
+blank+flag; Hall all-fields-missing → `employee_alt_layout`). `Case TUE RT =
+8.0` and `Case TOTALS RT = 32.0` ✓.
 
 ---
 
@@ -159,8 +170,9 @@ All 208 annotations in user feedback file `phase2_corpus_v3 - Feedback.xlsx` wer
 **Variable (discovered at runtime):**
 - Pay-totals row: 22 different positions observed (13, 14, 15, 17, 18, 20, 22,
   23, 24, 25, 28, 29, 30, 32, 33, 34, 37, 40, 41, 42)
-- Column profile: `standard` (MON at L) covers 464 sheets; `shifted` (MON at
-  M) covers 13 sheets
+- **THREE template families** (not two — corrects an earlier claim):
+  `standard` (MON at L, ~460 sheets), `shifted` (MON at M, 13 sheets), and
+  `Field Mechanic` (full day names at row 3, 29 sheets — see §6.3)
 - **WC State / ST column positions** drift across templates (see §6.1)
 - **Sheet header layout** varies (A1/B2 standard vs B1/C2 Hall-style — see §6.2)
 
@@ -200,6 +212,36 @@ Any time the resolver falls back, a `[CHECK]` flag is emitted on the TOTALS row'
 | `reference` | anything else (Job List, Equipment, ColumnLists, etc.) | silently skipped |
 
 The classifier does NOT use a hardcoded list of reference-sheet names — it's purely structural.
+
+### 6.3 Field Mechanic family (3rd template — in-progress extraction)
+
+29 sheets across ~14 workbooks (Coulson, Pottage, Beeler, Medina, Hall, Smith
+Dustin, Girtman). Title cell `Z1 = "FIELD MECHANIC TIME SHEET"`. **Structurally
+different — a line-item table, not a day-block grid.** Verified by raw-grid
+inspection (`scripts/inspect_fm_full.py`, `scripts/probe_fm_paytypes.py`).
+
+Two stacked grids on one sheet:
+1. **Clock-time summary**, rows 4–10: time labels in col M (Start=4, Lunch
+   Out=5, Lunch In=6, Stop=7), `Total Hours`=row 8. Day columns N,S,X,AC,AH,AM,AR
+   (stride 5) for MON..SUN; week total in AW.
+2. **Pay-coding line-item table**: header at **row 11** (found by label —
+   `WC STATE` at L11, `ST` at M11, then **7 days × 5 pay-types interleaved**:
+   `RT1 OT1 DT1 PTO1 HP1 | RT2 ... | ... RT7 ... HP7`). Each row 12+ is a
+   job/cost-code **line item**, not a day. Per-line total in `BB`.
+
+Key differences from standard:
+- Pay-types are **RT / OT / DT / PTO / HP** (not RT/OT/DT/PD/4D/4A). **PTO & HP
+  are real here** and map to the previously-always-blank PTO/HP output columns.
+- Day labels are **full names** (MONDAY..SUNDAY) at **row 3** (not MON/TUE).
+- Per-day pay-type totals are recoverable by summing each labelled `(day,
+  pay-type)` column down the line items (35 = 7×5 columns found by label on
+  every sheet).
+- Identity: Coulson/Pottage use A1/B2; Hall uses alt-layout B1/C2 (A1 empty).
+
+The manager's `phase2_corpus_v4 - Feedback.xlsx` deliberately had **no expected
+rows** for these — they were dropped until extraction was designed. The Phase-4
+label-driven path extracts them by discovering every field by label (no
+per-family branching), validated by arithmetic.
 
 ---
 

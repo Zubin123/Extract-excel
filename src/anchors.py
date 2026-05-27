@@ -6,10 +6,32 @@ that vary between files — those live in config/schema.yaml.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, time
 from typing import Iterable
 
+# Day vocabulary — short and full forms. Same field, minor label variation.
+# Add new localized variants here, not in code branches.
 DAY_TOKENS = {"MON", "TUE", "WED", "THUR", "THU", "FRI", "SAT", "SUN"}
+DAY_TOKENS_FULL = {
+    "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"
+}
+# Canonical MON..SUN order, mapping every accepted token to its weekday index.
+_DAY_ORDER = ["MON", "TUE", "WED", "THUR", "FRI", "SAT", "SUN"]
+_DAY_ALIASES = {
+    "MON": 0, "MONDAY": 0,
+    "TUE": 1, "TUESDAY": 1,
+    "WED": 2, "WEDNESDAY": 2,
+    "THUR": 3, "THU": 3, "THURSDAY": 3,
+    "FRI": 4, "FRIDAY": 4,
+    "SAT": 5, "SATURDAY": 5,
+    "SUN": 6, "SUNDAY": 6,
+}
+ALL_DAY_TOKENS = DAY_TOKENS | DAY_TOKENS_FULL
+
+# Pay-type header tokens followed by a day index, e.g. RT1, OT3, PTO7, HP2.
+# The trailing digit is the day number (1=first day .. 7=last day).
+PAYTYPE_DAY_RE = re.compile(r"^(RT|OT|DT|PTO|HP)(\d)$", re.IGNORECASE)
 
 
 def col_letter_to_index(col: str) -> int:
@@ -47,7 +69,7 @@ def find_day_label_row(ws, max_scan_row: int = 20) -> tuple[int, int] | None:
         hits = 0
         for c in range(1, max_c + 1):
             v = ws.cell(row=r, column=c).value
-            if isinstance(v, str) and v.strip().upper() in DAY_TOKENS:
+            if isinstance(v, str) and v.strip().upper() in ALL_DAY_TOKENS:
                 hits += 1
                 if first_col is None:
                     first_col = c
@@ -353,3 +375,125 @@ def resolve_pay_totals_row(
             f"with {best[1]} pay-type mismatch(es)"
         )
     return None, "no row had both day-block and grand-total numeric values"
+
+
+# ── Field Mechanic discovery (label-driven; no hardcoded cells) ───────────────
+#
+# Field Mechanic sheets are line-item tables, not day-block grids. Every
+# landmark below is found by the label it carries, so column/row drift between
+# files is tolerated. See CLAUDE.md §6.3.
+
+def find_label_in_grid(ws, label: str, max_r: int = 30, max_c: int = 20
+                       ) -> tuple[int, int] | None:
+    """Return (row, col) of the first cell whose text equals `label` (case-
+    insensitive, trimmed). Searches the top-left region only. None if absent."""
+    target = label.strip().upper()
+    rmax = min(ws.max_row or 0, max_r)
+    cmax = min(ws.max_column or 0, max_c)
+    for r in range(1, rmax + 1):
+        for c in range(1, cmax + 1):
+            v = ws.cell(row=r, column=c).value
+            if isinstance(v, str) and v.strip().upper() == target:
+                return r, c
+    return None
+
+
+def day_label_row_style(ws, max_scan_row: int = 20) -> str | None:
+    """Return 'full' if the day-label row uses MONDAY..SUNDAY, 'short' if it
+    uses MON..SUN, else None. This is the structural discriminator between the
+    Field Mechanic family (full names, row 3) and standard/shifted (short, row
+    4) — the day-name style determines the whole grid geometry.
+    """
+    max_c = min(ws.max_column or 0, 80)
+    max_r = min(ws.max_row or 0, max_scan_row)
+    for r in range(1, max_r + 1):
+        short = full = 0
+        for c in range(1, max_c + 1):
+            v = ws.cell(row=r, column=c).value
+            if isinstance(v, str):
+                u = v.strip().upper()
+                if u in DAY_TOKENS:
+                    short += 1
+                elif u in DAY_TOKENS_FULL:
+                    full += 1
+        if full >= 3:
+            return "full"
+        if short >= 3:
+            return "short"
+    return None
+
+
+def find_field_mechanic_header_row(ws, max_r: int = 30) -> int | None:
+    """The line-item header row: contains 'WC STATE' AND >=5 'RT#/OT#/...'
+    pay-type-with-day tokens. Discovered by label, never hardcoded.
+
+    Guarded by the day-name style: standard/shifted sheets ALSO carry
+    'WC STATE' + 'RT1/OT1...' headers, so the pay-type signature alone is NOT
+    unique. Field Mechanic is distinguished by FULL day names (MONDAY) in its
+    day-label row; standard/shifted use short names (MON). Only full-name
+    sheets take the Field Mechanic path.
+
+    Returns the 1-based row index, or None if this isn't a Field Mechanic sheet.
+    """
+    if day_label_row_style(ws) != "full":
+        return None
+
+    rmax = min(ws.max_row or 0, max_r)
+    cmax = min(ws.max_column or 0, 120)
+    for r in range(1, rmax + 1):
+        has_wc = False
+        paytype_hits = 0
+        for c in range(1, cmax + 1):
+            v = ws.cell(row=r, column=c).value
+            if isinstance(v, str):
+                u = v.strip().upper()
+                if u == "WC STATE":
+                    has_wc = True
+                elif PAYTYPE_DAY_RE.match(u):
+                    paytype_hits += 1
+        if has_wc and paytype_hits >= 5:
+            return r
+    return None
+
+
+def discover_field_mechanic_paytype_cols(ws, header_row: int
+                                         ) -> tuple[dict, list[int], list[str]]:
+    """Map each (day_index, pay_type) -> column index from the header row labels.
+
+    Returns (grid, day_indices, pay_types_seen) where:
+      - grid[(day_idx, PT)] = column index (1-based); day_idx is 0..6 (MON..SUN)
+        derived from the trailing digit (1->0 .. 7->6).
+      - day_indices = sorted list of day_idx values present.
+      - pay_types_seen = pay-type tokens encountered, in first-seen order.
+    """
+    grid: dict[tuple[int, str], int] = {}
+    day_indices: set[int] = set()
+    pay_types_seen: list[str] = []
+    cmax = min(ws.max_column or 0, 120)
+    for c in range(1, cmax + 1):
+        v = ws.cell(row=header_row, column=c).value
+        if not isinstance(v, str):
+            continue
+        m = PAYTYPE_DAY_RE.match(v.strip().upper())
+        if not m:
+            continue
+        pt = m.group(1).upper()
+        day_num = int(m.group(2))
+        if not (1 <= day_num <= 7):
+            continue
+        day_idx = day_num - 1
+        grid[(day_idx, pt)] = c
+        day_indices.add(day_idx)
+        if pt not in pay_types_seen:
+            pay_types_seen.append(pt)
+    return grid, sorted(day_indices), pay_types_seen
+
+
+def day_index_to_label(day_idx: int) -> str:
+    """0->MON .. 6->SUN (canonical short label for output)."""
+    return _DAY_ORDER[day_idx] if 0 <= day_idx < len(_DAY_ORDER) else f"DAY{day_idx+1}"
+
+
+def day_alias_index(token: str) -> int | None:
+    """Map any accepted day token (MON / MONDAY / THU / ...) to 0..6, else None."""
+    return _DAY_ALIASES.get(token.strip().upper()) if isinstance(token, str) else None

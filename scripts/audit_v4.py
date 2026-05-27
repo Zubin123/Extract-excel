@@ -27,6 +27,7 @@ import yaml  # noqa: E402
 from anchors import (  # noqa: E402
     classify_sheet, col_letter_to_index, resolve_anchor_cell,
     resolve_pay_totals_row, select_profile, sheet_has_day_grid,
+    find_field_mechanic_header_row, discover_field_mechanic_paytype_cols,
 )
 
 TOL = 0.01
@@ -80,6 +81,7 @@ def audit():
 
     employees_checked = 0
     employees_pay_match = 0
+    employees_fm_match = 0
     employees_th_match = 0
     employees_wc_match = 0
     employees_st_match = 0
@@ -106,6 +108,41 @@ def audit():
             out = by_emp[(excel_name, sheet_name)]
             totals = out["totals"]
             days   = out["days"]
+
+            # Field Mechanic sheets: independently re-derive per-day pay-type
+            # sums from the source by label discovery, then cross-check the
+            # output's TOTALS and day-row sums. (The standard BB..BG cell check
+            # below does not apply to this layout.)
+            fm_hr = find_field_mechanic_header_row(ws)
+            if fm_hr is not None:
+                grid, day_idxs, _pts = discover_field_mechanic_paytype_cols(ws, fm_hr)
+                last_row = ws.max_row or fm_hr
+                fm_pts = ["RT", "OT", "DT", "PTO", "HP"]
+                src_week = {pt: 0.0 for pt in fm_pts}
+                for (d_idx, pt), col in grid.items():
+                    for r in range(fm_hr + 1, last_row + 1):
+                        v = ws.cell(row=r, column=col).value
+                        if isinstance(v, (int, float)) and not isinstance(v, bool):
+                            src_week[pt] += float(v)
+                fm_ok = True
+                for pt in fm_pts:
+                    out_val = float(totals.get(pt) or 0.0)
+                    if abs(out_val - round(src_week[pt], 4)) > TOL:
+                        fm_ok = False
+                        note("fm_totals_mismatch_src",
+                             f"{excel_name} :: {sheet_name} :: {pt} out={out_val} src={src_week[pt]}")
+                # day-row sum vs TOTALS (internal consistency)
+                for pt in fm_pts:
+                    day_sum = sum(float(d.get(pt) or 0) for d in days)
+                    grand = float(totals.get(pt) or 0)
+                    if abs(day_sum - grand) > TOL:
+                        fm_ok = False
+                        note("fm_internal_daysum_vs_totals",
+                             f"{excel_name} :: {sheet_name} :: {pt} sum={day_sum} tot={grand}")
+                if fm_ok:
+                    employees_pay_match += 1
+                    employees_fm_match += 1
+                continue
 
             if not sheet_has_day_grid(ws, profiles):
                 # NO_GRID — but the filter is supposed to have dropped these.
@@ -212,8 +249,9 @@ def audit():
     print("=" * 70)
     print(f"Employee sheets checked: {employees_checked}")
     print()
-    print(f"Pay-type grand totals match source (BB..BG cells): "
-          f"{employees_pay_match}/{employees_checked}")
+    print(f"Pay-type grand totals match source: "
+          f"{employees_pay_match}/{employees_checked} "
+          f"(incl. {employees_fm_match} Field Mechanic by label-discovered cols)")
     print(f"Total Hours grand total matches source:            "
           f"{employees_th_match}/{employees_checked}")
     print(f"WC State matches header-resolved source value:     "

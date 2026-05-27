@@ -23,6 +23,12 @@ from openpyxl.styles import Font, PatternFill
 from anchors import (
     classify_sheet,
     col_letter_to_index,
+    day_alias_index,
+    day_index_to_label,
+    discover_field_mechanic_paytype_cols as discover_fm_paytype_cols,
+    find_day_label_row,
+    find_field_mechanic_header_row,
+    find_label_in_grid as anchors_find_label_in_grid,
     resolve_anchor_cell,
     resolve_pay_totals_row,
     select_profile,
@@ -367,6 +373,166 @@ def extract_sheet_no_grid(ws, folder_name: str, box_name: str,
     return rows
 
 
+def extract_field_mechanic_sheet(ws, header_row: int, folder_name: str,
+                                 box_name: str, excel_name: str,
+                                 kind: str = "employee") -> list[dict]:
+    """Extract a Field Mechanic line-item sheet into the standard per-day output.
+
+    Everything is discovered by label (see anchors.find_field_mechanic_*):
+      - identity (name/EE ID) per `kind` (A1/B2 standard, B1/C2 alt-layout)
+      - WC State / ST by label in the header row
+      - day columns + dates + clock-time cells from the day-label row & the
+        'Total Hours' clock-summary row
+      - per-day pay-type hours (RT/OT/DT/PTO/HP) by summing each labelled
+        (day, pay-type) column down the line-item rows below `header_row`
+
+    Produces 7 day rows (MON..SUN) + a TOTALS row, matching the output schema.
+    Unresolvable fields are left blank and flagged with [CHECK] — never guessed.
+    """
+    sheet_name = ws.title
+
+    # Identity — reuse the same per-kind rules as the standard path.
+    raw_a1 = ws["A1"].value
+    anchor_issues: list[str] = []
+    if kind == "employee_alt_layout":
+        employee_name = ws["B1"].value or ""
+        ee_id = ws["C2"].value
+        anchor_issues.append("[CHECK] Alternate layout — Employee Name from B1, EE ID from C2")
+    elif kind == "employee_placeholder":
+        employee_name = ""
+        ee_id = ws["B2"].value
+        anchor_issues.append(
+            f"[CHECK] Employee Name placeholder in A1 ({raw_a1!r}) — left blank (no reliable source)"
+        )
+    else:
+        employee_name = raw_a1 or ""
+        ee_id = ws["B2"].value
+
+    # WC State / ST — by label, in the discovered header row (value sits in the
+    # data rows below; take the first non-blank).
+    def _resolve_label_value(label: str):
+        loc = anchors_find_label_in_grid(ws, label, max_r=header_row + 1, max_c=20)
+        if loc is None:
+            return "", f"[CHECK] {label} header not found"
+        hr, hc = loc
+        for r in range(hr + 1, min((ws.max_row or hr) + 1, hr + 30)):
+            v = ws.cell(row=r, column=hc).value
+            if v is not None and not (isinstance(v, str) and v.strip() == ""):
+                if isinstance(v, str) and v.strip().upper() in ("#N/A", "#VALUE!"):
+                    continue
+                return v, None
+        return "", f"[CHECK] {label} empty — no value in column below header"
+
+    wc_state, wc_issue = _resolve_label_value("WC STATE")
+    st, st_issue = _resolve_label_value("ST")
+    for issue in (wc_issue, st_issue):
+        if issue:
+            anchor_issues.append(issue)
+
+    # Day-label row + columns (full names at row 3 — found by vocabulary).
+    day_row_info = find_day_label_row(ws)
+    grid, day_indices, _pts_seen = discover_fm_paytype_cols(ws, header_row)
+
+    # Clock-time summary: locate the time-label column ('Start'/'Stop' etc.) and
+    # the 'Total Hours' clock row, both by label.
+    th_loc = anchors_find_label_in_grid(ws, "Total Hours", max_r=header_row, max_c=20)
+    start_loc = anchors_find_label_in_grid(ws, "Start", max_r=header_row, max_c=20)
+    lout_loc  = anchors_find_label_in_grid(ws, "Lunch Out", max_r=header_row, max_c=20)
+    lin_loc   = anchors_find_label_in_grid(ws, "Lunch In", max_r=header_row, max_c=20)
+    stop_loc  = anchors_find_label_in_grid(ws, "Stop", max_r=header_row, max_c=20)
+    total_hours_row = th_loc[0] if th_loc else None
+    start_row = start_loc[0] if start_loc else None
+    lout_row  = lout_loc[0] if lout_loc else None
+    lin_row   = lin_loc[0] if lin_loc else None
+    stop_row  = stop_loc[0] if stop_loc else None
+
+    # Day columns of the clock grid: the day-label row's columns, in order.
+    # Build day_idx -> clock-column from the day-label row tokens.
+    clock_day_cols: dict[int, int] = {}
+    date_row = None
+    if day_row_info is not None:
+        day_label_row = day_row_info[0]
+        date_row = day_label_row - 1  # invariant: date row is one above day labels
+        cmax = min(ws.max_column or 0, 120)
+        for c in range(1, cmax + 1):
+            v = ws.cell(row=day_label_row, column=c).value
+            if isinstance(v, str):
+                idx = day_alias_index(v.strip().upper())
+                if idx is not None and idx not in clock_day_cols:
+                    clock_day_cols[idx] = c
+
+    last_row = ws.max_row or header_row
+    rows: list[dict] = []
+    pay_out_types = ["RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP"]
+    week_totals = {pt: 0.0 for pt in pay_out_types}
+    week_total_hours = 0.0
+    any_total_hours = False
+
+    for day_idx in range(7):
+        day_label = day_index_to_label(day_idx)
+        clock_col = clock_day_cols.get(day_idx)
+
+        # Per-day pay-type sums from the line-item table (label-discovered cols).
+        day_pay = {pt: 0.0 for pt in pay_out_types}
+        for pt in ("RT", "OT", "DT", "PTO", "HP"):
+            col = grid.get((day_idx, pt))
+            if col is not None:
+                s = 0.0
+                for r in range(header_row + 1, last_row + 1):
+                    s += coerce_hours(ws.cell(row=r, column=col).value)
+                day_pay[pt] = round(s, 4)
+                week_totals[pt] += day_pay[pt]
+
+        # Clock-grid cells (date / times / daily Total Hours) by discovered cols.
+        def _clock(rownum):
+            if rownum is None or clock_col is None:
+                return None
+            return ws.cell(row=rownum, column=clock_col).value
+
+        date_val   = ws.cell(row=date_row, column=clock_col).value if (date_row and clock_col) else None
+        time_start = _clock(start_row)
+        lunch_out  = _clock(lout_row)
+        lunch_in   = _clock(lin_row)
+        stop       = _clock(stop_row)
+        total_hrs  = coerce_total_hours(_clock(total_hours_row))
+        if total_hrs is not None:
+            week_total_hours += total_hrs
+            any_total_hours = True
+
+        rows.append({
+            "Folder Name": folder_name, "Box Name": box_name,
+            "Excel Name": excel_name, "Sheet Name": sheet_name,
+            "Employee Name": employee_name, "EE ID": ee_id,
+            "WC State": wc_state, "ST": st,
+            "Date": fmt_date(date_val), "Day": day_label,
+            "Start": fmt_time(time_start), "Lunch Out": fmt_time(lunch_out),
+            "Lunch In": fmt_time(lunch_in), "Stop": fmt_time(stop),
+            "Total Hours": total_hrs,
+            "RT": day_pay["RT"], "OT": day_pay["OT"], "DT": day_pay["DT"],
+            "PD": 0.0, "4D": 0.0, "4A": 0.0,
+            "PTO": day_pay["PTO"], "HP": day_pay["HP"],
+            "QA_Flag": "OK",
+        })
+
+    # TOTALS row — week sums (computed from the discovered columns).
+    totals_flag = "; ".join(anchor_issues) if anchor_issues else "OK"
+    rows.append({
+        "Folder Name": folder_name, "Box Name": box_name,
+        "Excel Name": excel_name, "Sheet Name": sheet_name,
+        "Employee Name": employee_name, "EE ID": ee_id,
+        "WC State": wc_state, "ST": st,
+        "Date": "", "Day": "TOTALS",
+        "Start": "", "Lunch Out": "", "Lunch In": "", "Stop": "",
+        "Total Hours": round(week_total_hours, 4) if any_total_hours else None,
+        "RT": round(week_totals["RT"], 4), "OT": round(week_totals["OT"], 4),
+        "DT": round(week_totals["DT"], 4),
+        "PD": 0.0, "4D": 0.0, "4A": 0.0,
+        "PTO": round(week_totals["PTO"], 4), "HP": round(week_totals["HP"], 4),
+        "QA_Flag": totals_flag,
+    })
+    return rows
+
+
 def check_accuracy(employee_rows: list[dict], pay_types: list[str],
                    tolerance: float) -> tuple[bool, dict]:
     day_rows   = [r for r in employee_rows if r["Day"] != "TOTALS"]
@@ -508,6 +674,31 @@ def process_workbook(input_path: Path, config: dict, folder_name: str,
             unmatched.append({
                 "File": excel_name, "Sheet": sheet_name,
                 "Reason": f"unfilled employee template: {classify_reason}",
+            })
+            continue
+
+        # Field Mechanic family — a line-item table, not a day-block grid.
+        # Detected by its label-bearing header row (WC STATE + RT#/OT#/...).
+        # Every field is resolved by label inside extract_field_mechanic_sheet.
+        fm_header_row = find_field_mechanic_header_row(ws)
+        if fm_header_row is not None:
+            fm_rows = extract_field_mechanic_sheet(
+                ws, fm_header_row, folder_name, box_name, excel_name, kind=kind,
+            )
+            data_rows.extend(fm_rows)
+            totals_row = next(r for r in fm_rows if r["Day"] == "TOTALS")
+            sheet_issue = totals_row["QA_Flag"] if totals_row["QA_Flag"] != "OK" else ""
+            needs_review = "[CHECK]" in sheet_issue or "[WARN]" in sheet_issue
+            qa_rows.append({
+                "File":           excel_name,
+                "Employee":       fm_rows[0]["Employee Name"],
+                "Sheet Name":     sheet_name,
+                "Profile":        "field_mechanic",
+                "Pay Totals Row": f"header row {fm_header_row}",
+                "QA Method":      "Field Mechanic line-item sums by label-discovered (day,pay-type) columns",
+                "Tolerance":      tolerance,
+                "Sheet Issues":   sheet_issue,
+                "Overall":        "REVIEW" if needs_review else "PASS",
             })
             continue
 
