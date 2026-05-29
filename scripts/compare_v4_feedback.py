@@ -20,7 +20,7 @@ from collections import Counter, defaultdict
 import openpyxl
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT = ROOT / "output" / "corpus_vs.xlsx"
+CURRENT = ROOT / "output" / "corpus_v5.xlsx"
 FEEDBACK = ROOT / "phase2_corpus_v4 - Feedback.xlsx"
 
 # Expected-block columns in the feedback file (cols 27..48, 1-based).
