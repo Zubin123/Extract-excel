@@ -26,8 +26,10 @@ from anchors import (
     day_alias_index,
     day_index_to_label,
     discover_field_mechanic_paytype_cols as discover_fm_paytype_cols,
+    discover_paytype_columns_by_label,
     find_day_label_row,
     find_field_mechanic_header_row,
+    find_fm_job_col,
     find_label_in_grid as anchors_find_label_in_grid,
     resolve_anchor_cell,
     resolve_pay_totals_row,
@@ -187,15 +189,38 @@ def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
     db = profile["day_blocks"]
     day_labels = db["day_labels"]
     day_start_cols = db["day_start_cols"]
-    pay_types = db["pay_types"]
+    fallback_pay_types = db["pay_types"]  # YAML fallback, used only if no labels discovered
 
     date_row = profile["date_row"]
     total_hours_row = profile["total_hours_row"]
     t_rows = profile["time_rows"]
 
+    # Label-driven pay-type discovery: read each column's actual label in the
+    # header row (the row containing 'WC STATE') and route values to the
+    # output field matching the label. Closes the silent-position-drift class
+    # — sheets where M='PTO1' instead of M='OT1' now route correctly without
+    # any per-sheet config. See anchors.discover_paytype_columns_by_label.
+    header_loc = anchors_find_label_in_grid(ws, "WC STATE", max_r=30, max_c=20)
+    paytype_header_row = header_loc[0] if header_loc else None
+    day_start_idx_list = [col_letter_to_index(c) for c in day_start_cols]
+    paytype_grid: dict[tuple[int, str], int] = {}
+    if paytype_header_row is not None:
+        paytype_grid, discovery_issues = discover_paytype_columns_by_label(
+            ws, paytype_header_row, day_start_idx_list
+        )
+        anchor_issues.extend(discovery_issues)
+    else:
+        anchor_issues.append(
+            "[CHECK] WC STATE header not found — falling back to YAML pay-type positions"
+        )
+
+    # Fallback: positional reading from YAML, only when label discovery yielded
+    # nothing for a day. We always emit the 8 canonical output columns.
+    OUTPUT_PAY_TYPES = ["RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP"]
+
     rows = []
 
-    for day_label, start_col in zip(day_labels, day_start_cols):
+    for day_idx, (day_label, start_col) in enumerate(zip(day_labels, day_start_cols)):
         start_idx = col_letter_to_index(start_col)
 
         date_val   = ws.cell(row=date_row, column=start_idx).value
@@ -205,11 +230,24 @@ def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
         stop       = ws.cell(row=t_rows["Stop"],      column=start_idx).value
         total_hrs  = ws.cell(row=total_hours_row,     column=start_idx).value
 
-        day_hours = {}
-        for i, col_name in enumerate(pay_types):
-            day_hours[col_name] = coerce_hours(
-                ws.cell(row=pay_totals_row, column=start_idx + i).value
-            )
+        # Read each output pay-type from its label-discovered column.
+        day_hours = {pt: 0.0 for pt in OUTPUT_PAY_TYPES}
+        has_any_discovered = any((day_idx, pt) in paytype_grid for pt in OUTPUT_PAY_TYPES)
+        if has_any_discovered:
+            for pt in OUTPUT_PAY_TYPES:
+                col = paytype_grid.get((day_idx, pt))
+                if col is not None:
+                    day_hours[pt] = coerce_hours(
+                        ws.cell(row=pay_totals_row, column=col).value
+                    )
+        else:
+            # No labels found for this day — fall back to YAML positions.
+            # Don't populate PTO/HP via fallback (they aren't in the YAML list).
+            for i, col_name in enumerate(fallback_pay_types):
+                if col_name in OUTPUT_PAY_TYPES:
+                    day_hours[col_name] = coerce_hours(
+                        ws.cell(row=pay_totals_row, column=start_idx + i).value
+                    )
 
         time_cells = {
             "Start":     (f"{start_col}{t_rows['Start']}",     time_start),
@@ -238,22 +276,37 @@ def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
             "Lunch In":      fmt_time(lunch_in),
             "Stop":          fmt_time(stop),
             "Total Hours":   coerce_total_hours(total_hrs),
-            **{pt: day_hours[pt] for pt in pay_types},
-            "PTO": "",
-            "HP":  "",
+            **{pt: day_hours[pt] for pt in OUTPUT_PAY_TYPES},
             "QA_Flag": qa_flag,
         })
 
-    # TOTALS row — grand weekly totals from grand_totals.cols on pay_totals_row
-    # and total_hours_col on total_hours_row.
+    # TOTALS row — sum each output pay-type across the 7 day rows we just
+    # produced. The day values themselves came from label-discovered columns,
+    # so summing them is the authoritative total. We additionally cross-check
+    # against the source's grand-totals row (BB..BG / BC..BH) for pay-types
+    # that map positionally — mismatches surface as a [CHECK].
     gt_cols = profile["grand_totals"]["cols"]
     th_col = profile["grand_totals"]["total_hours_col"]
 
-    totals_hours = {}
-    for col_name, col_letter in zip(pay_types, gt_cols):
-        totals_hours[col_name] = coerce_hours(
-            ws.cell(row=pay_totals_row, column=col_letter_to_index(col_letter)).value
-        )
+    totals_hours = {pt: 0.0 for pt in OUTPUT_PAY_TYPES}
+    for pt in OUTPUT_PAY_TYPES:
+        totals_hours[pt] = round(sum(r[pt] for r in rows), 4)
+
+    # Cross-check: for the YAML's fallback_pay_types (which positionally map to
+    # gt_cols), the source's grand-totals cells should equal our computed sum.
+    for col_name, col_letter in zip(fallback_pay_types, gt_cols):
+        if col_name not in OUTPUT_PAY_TYPES:
+            continue
+        src_gt = ws.cell(row=pay_totals_row,
+                         column=col_letter_to_index(col_letter)).value
+        if isinstance(src_gt, (int, float)):
+            our_sum = totals_hours[col_name]
+            if abs(float(src_gt) - our_sum) > 0.01:
+                # Trust the discovered-column sum (label-driven), but flag.
+                anchor_issues.append(
+                    f"[CHECK] {col_name} grand-total cell = {src_gt} disagrees with "
+                    f"label-discovered day-sum {our_sum}"
+                )
 
     grand_th_cell = f"{th_col}{total_hours_row}"
     grand_total_hours_raw = ws[grand_th_cell].value
@@ -290,9 +343,7 @@ def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
         "Lunch In":      "",
         "Stop":          "",
         "Total Hours":   grand_total_hours,
-        **{pt: totals_hours[pt] for pt in pay_types},
-        "PTO": "",
-        "HP":  "",
+        **{pt: totals_hours[pt] for pt in OUTPUT_PAY_TYPES},
         "QA_Flag": totals_flag,
     })
 
@@ -433,6 +484,24 @@ def extract_field_mechanic_sheet(ws, header_row: int, folder_name: str,
     day_row_info = find_day_label_row(ws)
     grid, day_indices, _pts_seen = discover_fm_paytype_cols(ws, header_row)
 
+    # JOB column — only rows with a job code are real line items. Rows below
+    # without a JOB value are echo/import-shadow rows that duplicate per-day
+    # pay-type cells; summing them double-counts. If we can't find the JOB
+    # column we fall back to "all rows" (and surface a [CHECK] flag).
+    job_col = find_fm_job_col(ws, header_row)
+    if job_col is None:
+        anchor_issues.append("[CHECK] FM JOB column not found — line-item filter disabled (sums may double-count)")
+
+    def _is_line_item_row(r: int) -> bool:
+        if job_col is None:
+            return True
+        v = ws.cell(row=r, column=job_col).value
+        if v is None:
+            return False
+        if isinstance(v, str) and v.strip() == "":
+            return False
+        return True
+
     # Clock-time summary: locate the time-label column ('Start'/'Stop' etc.) and
     # the 'Total Hours' clock row, both by label.
     th_loc = anchors_find_label_in_grid(ws, "Total Hours", max_r=header_row, max_c=20)
@@ -473,12 +542,16 @@ def extract_field_mechanic_sheet(ws, header_row: int, folder_name: str,
         clock_col = clock_day_cols.get(day_idx)
 
         # Per-day pay-type sums from the line-item table (label-discovered cols).
+        # Only sum rows that ARE line items (JOB column populated) — echo rows
+        # below the line-item block duplicate per-day pay-type cells.
         day_pay = {pt: 0.0 for pt in pay_out_types}
         for pt in ("RT", "OT", "DT", "PTO", "HP"):
             col = grid.get((day_idx, pt))
             if col is not None:
                 s = 0.0
                 for r in range(header_row + 1, last_row + 1):
+                    if not _is_line_item_row(r):
+                        continue
                     s += coerce_hours(ws.cell(row=r, column=col).value)
                 day_pay[pt] = round(s, 4)
                 week_totals[pt] += day_pay[pt]
@@ -569,8 +642,53 @@ def check_accuracy(employee_rows: list[dict], pay_types: list[str],
 
 # ── Writer ──────────────────────────────────────────────────────────────────
 
+_NUMERIC_OUTPUT_COLS = ("Total Hours", "RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP")
+
+
+def _format_numeric_cells(data_df: pd.DataFrame) -> pd.DataFrame:
+    """Render numeric output columns as 2-decimal strings to match the feedback
+    file's format. Zero / None on a day row becomes '0.00' (the manager treats
+    blanks as zero); TOTALS rows keep Total Hours but blank-out pay-types to
+    match the manager's expected layout. In-memory floats are preserved by
+    operating on a copy.
+    """
+    df = data_df.copy()
+    if "Day" not in df.columns:
+        return df
+
+    def fmt(v):
+        if v is None or v == "":
+            return "0.00"
+        if isinstance(v, float) and v != v:  # NaN
+            return "0.00"
+        try:
+            return f"{float(v):.2f}"
+        except (TypeError, ValueError):
+            return v  # leave non-numeric (e.g. error strings) alone
+
+    is_totals = df["Day"].astype(str).str.upper() == "TOTALS"
+
+    for col in _NUMERIC_OUTPUT_COLS:
+        if col not in df.columns:
+            continue
+        # Cast to object so we can mix strings and numbers in the same column
+        # without pandas rejecting the assignment as a dtype violation.
+        df[col] = df[col].astype(object)
+        if col == "Total Hours":
+            df[col] = df[col].map(fmt)
+        else:
+            # Day rows: format zero/None as '0.00'; TOTALS rows: keep the
+            # numeric grand total. Manager's expected block leaves pay-type
+            # TOTALS blank; losing that data in our output costs more than
+            # the cosmetic mismatch (the comparison ignores unspecified cells).
+            day_mask = ~is_totals
+            df.loc[day_mask, col] = df.loc[day_mask, col].map(fmt)
+    return df
+
+
 def _write_excel(out_path: Path, data_df: pd.DataFrame, qa_rows: list[dict],
                  run_info: dict, unmatched: list[dict], id_conflicts: list[dict]):
+    data_df = _format_numeric_cells(data_df)
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         data_df.to_excel(writer, sheet_name="Data", index=False)
         pd.DataFrame(qa_rows).to_excel(writer, sheet_name="QA_Summary", index=False)

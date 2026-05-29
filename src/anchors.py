@@ -29,9 +29,11 @@ _DAY_ALIASES = {
 }
 ALL_DAY_TOKENS = DAY_TOKENS | DAY_TOKENS_FULL
 
-# Pay-type header tokens followed by a day index, e.g. RT1, OT3, PTO7, HP2.
+# Pay-type header tokens followed by a day index, e.g. RT1, OT3, PTO7, 4D5.
 # The trailing digit is the day number (1=first day .. 7=last day).
-PAYTYPE_DAY_RE = re.compile(r"^(RT|OT|DT|PTO|HP)(\d)$", re.IGNORECASE)
+# Tokens cover every pay-type seen across all template families:
+#   RT, OT, DT, PD, 4D, 4A (standard); PTO, HP (Field Mechanic + drift variants)
+PAYTYPE_DAY_RE = re.compile(r"^(RT|OT|DT|PD|4D|4A|PTO|HP)(\d)$", re.IGNORECASE)
 
 
 def col_letter_to_index(col: str) -> int:
@@ -453,6 +455,82 @@ def find_field_mechanic_header_row(ws, max_r: int = 30) -> int | None:
                     paytype_hits += 1
         if has_wc and paytype_hits >= 5:
             return r
+    return None
+
+
+def discover_paytype_columns_by_label(
+    ws, header_row: int, day_start_cols: list[int]
+) -> tuple[dict[tuple[int, str], int], list[str]]:
+    """For every column under each day-block, read its label in `header_row`
+    and map it to the output pay-type field by label.
+
+    Returns:
+      grid:    {(day_idx, pay_type): column_index} where pay_type is the
+               canonical output field name (RT/OT/DT/PD/4D/4A/PTO/HP).
+      issues:  list of [CHECK] messages for any column whose label couldn't
+               be matched (unknown tokens, missing day index, etc).
+
+    This unifies the standard and Field Mechanic paths: each column is
+    routed to the output field that matches its actual label, regardless
+    of how the YAML profile is configured. Closes the silent position-
+    drift class (e.g. Wirth M12='PTO1' was being read as OT positionally).
+
+    Day indices in the returned grid are 0..n-1 corresponding to
+    day_start_cols in order. We don't fix a block width — we scan from
+    each day's start column up to (the next day's start column - 1) or,
+    for the last day, a sensible bound.
+    """
+    OUTPUT_TYPES = {"RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP"}
+    grid: dict[tuple[int, str], int] = {}
+    issues: list[str] = []
+
+    # Compute scan extent for each day block from the day_start_cols list.
+    bounds = []
+    for i, start in enumerate(day_start_cols):
+        end = day_start_cols[i + 1] - 1 if i + 1 < len(day_start_cols) else start + 8
+        bounds.append((start, end))
+
+    for day_idx, (start, end) in enumerate(bounds):
+        for c in range(start, end + 1):
+            v = ws.cell(row=header_row, column=c).value
+            if not isinstance(v, str):
+                continue
+            m = PAYTYPE_DAY_RE.match(v.strip().upper())
+            if not m:
+                continue
+            label_pt = m.group(1).upper()
+            label_day = int(m.group(2))
+            # Validate the day index matches where the column sits.
+            if label_day != day_idx + 1:
+                issues.append(
+                    f"[CHECK] header col {col_index_to_letter(c)}{header_row}={v!r} "
+                    f"but it sits under day {day_idx+1} block — label/position mismatch"
+                )
+                continue
+            if label_pt not in OUTPUT_TYPES:
+                issues.append(
+                    f"[CHECK] header col {col_index_to_letter(c)}{header_row}={v!r} "
+                    f"— unknown pay-type token, value will not be extracted"
+                )
+                continue
+            grid[(day_idx, label_pt)] = c
+    return grid, issues
+
+
+def find_fm_job_col(ws, header_row: int) -> int | None:
+    """Locate the 'JOB' column in the Field Mechanic header row by label.
+
+    Field Mechanic sheets have a row labelled 'JOB' in the header. Each
+    real line item below carries a job code in that column; echo/import-
+    shadow rows (which duplicate per-day pay-type values for accounting
+    purposes) leave it blank. Filtering by this column eliminates
+    double-counting without any hardcoded cell.
+    """
+    cmax = min(ws.max_column or 0, 30)
+    for c in range(1, cmax + 1):
+        v = ws.cell(row=header_row, column=c).value
+        if isinstance(v, str) and v.strip().upper() == "JOB":
+            return c
     return None
 
 

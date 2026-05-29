@@ -28,11 +28,32 @@ from anchors import (  # noqa: E402
     classify_sheet, col_letter_to_index, resolve_anchor_cell,
     resolve_pay_totals_row, select_profile, sheet_has_day_grid,
     find_field_mechanic_header_row, discover_field_mechanic_paytype_cols,
+    find_fm_job_col,
 )
 
 TOL = 0.01
 OUT = ROOT / "output" / "phase2_corpus_v4.xlsx"
 DATA = ROOT / "data"
+
+
+def to_num(v):
+    """Coerce a value to float; numeric output is now written as '0.00'-style
+    strings (matching the feedback format). Returns None if it isn't numeric."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
 
 
 def load_output():
@@ -119,22 +140,29 @@ def audit():
                 last_row = ws.max_row or fm_hr
                 fm_pts = ["RT", "OT", "DT", "PTO", "HP"]
                 src_week = {pt: 0.0 for pt in fm_pts}
+                job_col = find_fm_job_col(ws, fm_hr)
+                def _is_line_item(r):
+                    if job_col is None: return True
+                    v = ws.cell(row=r, column=job_col).value
+                    return v is not None and not (isinstance(v, str) and v.strip() == "")
                 for (d_idx, pt), col in grid.items():
                     for r in range(fm_hr + 1, last_row + 1):
+                        if not _is_line_item(r):
+                            continue
                         v = ws.cell(row=r, column=col).value
                         if isinstance(v, (int, float)) and not isinstance(v, bool):
                             src_week[pt] += float(v)
                 fm_ok = True
                 for pt in fm_pts:
-                    out_val = float(totals.get(pt) or 0.0)
+                    out_val = to_num(totals.get(pt)) or 0.0
                     if abs(out_val - round(src_week[pt], 4)) > TOL:
                         fm_ok = False
                         note("fm_totals_mismatch_src",
                              f"{excel_name} :: {sheet_name} :: {pt} out={out_val} src={src_week[pt]}")
                 # day-row sum vs TOTALS (internal consistency)
                 for pt in fm_pts:
-                    day_sum = sum(float(d.get(pt) or 0) for d in days)
-                    grand = float(totals.get(pt) or 0)
+                    day_sum = sum((to_num(d.get(pt)) or 0) for d in days)
+                    grand = to_num(totals.get(pt)) or 0
                     if abs(day_sum - grand) > TOL:
                         fm_ok = False
                         note("fm_internal_daysum_vs_totals",
@@ -142,6 +170,55 @@ def audit():
                 if fm_ok:
                     employees_pay_match += 1
                     employees_fm_match += 1
+
+                # Field Mechanic WC State / ST — discovered by label in the
+                # header row, then read from the first non-blank cell below
+                # (same logic the extractor uses; no hardcoded cell).
+                def _fm_label_value(label):
+                    target = label.strip().upper()
+                    cmax = min(ws.max_column or 0, 30)
+                    found_col = None
+                    for c in range(1, cmax + 1):
+                        v = ws.cell(row=fm_hr, column=c).value
+                        if isinstance(v, str) and v.strip().upper() == target:
+                            found_col = c
+                            break
+                    if found_col is None:
+                        return None
+                    for r in range(fm_hr + 1, min(last_row, fm_hr + 30) + 1):
+                        v = ws.cell(row=r, column=found_col).value
+                        if v is None: continue
+                        if isinstance(v, str):
+                            s = v.strip()
+                            if s == "" or s.upper() in ("#N/A", "#VALUE!"):
+                                continue
+                            return s
+                        return v
+                    return None
+
+                src_wc = _fm_label_value("WC STATE")
+                src_st = _fm_label_value("ST")
+                out_wc = totals.get("WC State")
+                out_st = totals.get("ST")
+                def _eq(a, b):
+                    if a is None and (b is None or b == ""): return True
+                    if b is None and (a is None or a == ""): return True
+                    return str(a).strip() == str(b).strip()
+                if _eq(src_wc, out_wc):
+                    employees_wc_match += 1
+                else:
+                    note("fm_wc_state_mismatch",
+                         f"{excel_name} :: {sheet_name} src={src_wc!r} out={out_wc!r}")
+                if _eq(src_st, out_st):
+                    employees_st_match += 1
+                else:
+                    note("fm_st_mismatch",
+                         f"{excel_name} :: {sheet_name} src={src_st!r} out={out_st!r}")
+
+                # Note: FM Total Hours comes from the clock-grid (rows 4-8) which
+                # is worked clock-time, legitimately distinct from line-item
+                # pay-type sums (see CLAUDE.md §6.3). Counting the day-summed
+                # Total Hours against the AW8 weekly total instead.
                 continue
 
             if not sheet_has_day_grid(ws, profiles):
@@ -168,8 +245,8 @@ def audit():
 
             pay_ok = True
             for pt in pay_types:
-                out_val = totals.get(pt) or 0.0
-                if abs(float(out_val) - src_gt[pt]) > TOL:
+                out_val = to_num(totals.get(pt)) or 0.0
+                if abs(out_val - src_gt[pt]) > TOL:
                     pay_ok = False
                     note("totals_row_mismatch_src",
                          f"{excel_name} :: {sheet_name} :: {pt} out={out_val} src={src_gt[pt]}")
@@ -179,8 +256,8 @@ def audit():
             # Day-row sum vs TOTALS (already in output — pure self-check)
             internal_ok = True
             for pt in pay_types:
-                day_sum = sum(float(d.get(pt) or 0) for d in days)
-                grand   = float(totals.get(pt) or 0)
+                day_sum = sum((to_num(d.get(pt)) or 0) for d in days)
+                grand   = to_num(totals.get(pt)) or 0
                 if abs(day_sum - grand) > TOL:
                     internal_ok = False
                     note("internal_daysum_vs_totals",
@@ -191,15 +268,16 @@ def audit():
             th_row = prof["total_hours_row"]
             src_th = ws.cell(row=th_row, column=col_letter_to_index(th_col)).value
             out_th = totals.get("Total Hours")
-            if isinstance(src_th, (int, float)) and isinstance(out_th, (int, float)):
-                if abs(float(src_th) - float(out_th)) > TOL:
+            out_th_num = to_num(out_th)
+            if isinstance(src_th, (int, float)) and out_th_num is not None:
+                if abs(float(src_th) - out_th_num) > TOL:
                     note("total_hours_mismatch",
                          f"{excel_name} :: {sheet_name} src={src_th} out={out_th}")
                 else:
                     employees_th_match += 1
             elif isinstance(src_th, str) and "VALUE" in src_th.upper():
                 note("source_th_value_error", f"{excel_name} :: {sheet_name} src={src_th!r} out={out_th}")
-            elif src_th is None and out_th is not None:
+            elif src_th is None and out_th_num is not None:
                 note("source_th_none_out_has_value", f"{excel_name} :: {sheet_name} src=None out={out_th}")
             else:
                 note("th_type_mismatch", f"{excel_name} :: {sheet_name} src={src_th!r} ({type(src_th).__name__}) out={out_th!r} ({type(out_th).__name__})")
@@ -228,15 +306,15 @@ def audit():
 
             # Suspect values
             for d in days:
-                th = d.get("Total Hours")
-                if isinstance(th, (int, float)):
-                    if th < 0:
+                th_n = to_num(d.get("Total Hours"))
+                if th_n is not None:
+                    if th_n < 0:
                         suspicious_values["negative_total_hours"] += 1
-                    if th > 24:
+                    if th_n > 24:
                         suspicious_values["over_24h_in_a_day"] += 1
                 for pt in pay_types:
-                    v = d.get(pt)
-                    if isinstance(v, (int, float)) and v < 0:
+                    vn = to_num(d.get(pt))
+                    if vn is not None and vn < 0:
                         suspicious_values[f"negative_{pt}"] += 1
                 wc = d.get("WC State")
                 if isinstance(wc, str) and wc and wc not in (
