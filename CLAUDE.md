@@ -710,19 +710,46 @@ sessions should preserve:
 
 ## 16. Large-dataset handling (years 2022, 2024, 2025, 2026)
 
-When processing the full corpus (500-800 MB per year folder, ~2-3 GB total):
+The full corpus is **~1-1.4 GB per year folder, ~4-5.6 GB total** uncompressed
+`.xlsx` files (the 500-800 MB figure earlier was the compressed/zipped form).
+Estimated ~250-500 workbooks per year, ~1,000-2,000 workbooks total.
 
+### Storage
 - **Don't put it in the repo working tree.** Git `status` walks the working
-  tree even when files are gitignored. Use an external path like
-  `D:\timesheet-data\2024\` and pass it via CLI:
-  `.venv\Scripts\python.exe src\extract.py "D:\timesheet-data\2024" --out output\corpus_2024.xlsx`
-- **Avoid OneDrive / cloud-synced paths.** Same corruption risk that motivated
-  moving the working tree off OneDrive (CLAUDE.md §12). External SSD over
-  USB is fine; mounted SharePoint / OneDrive is not.
-- **One output workbook per year.** Single mega-output gets unwieldy in Excel.
-  Per-year (`corpus_2024.xlsx`) keeps each file openable.
-- **Single-process is the bottleneck.** §9 item 1 notes a ~1-day
-  `multiprocessing.Pool` task would give ~10× speedup. Not done yet.
-- **Excel row limit = 1,048,576.** At ~200-400 employees × 8 rows × ~50 weeks
-  per year = 80-160k rows per year — well within limits. If a single year
-  ever exceeds, switch to CSV/Parquet output (§9 item 2).
+  tree even when files are gitignored — 5 GB of files = thousands of inode
+  stats per command. Use an external path like `D:\timesheet-data\2024\` and
+  pass it via CLI:
+  ```powershell
+  .venv\Scripts\python.exe src\extract.py "D:\timesheet-data\2024" --out output\corpus_2024.xlsx
+  ```
+- **Avoid OneDrive / SharePoint / cloud-synced paths.** Same corruption risk
+  that motivated moving the working tree off OneDrive (§12). External SSD
+  over USB is fine; mounted SharePoint / OneDrive is not.
+
+### Output sizing
+- **One output workbook per year.** Extrapolating from sample2 (63 wb →
+  ~3,200 data rows): roughly ~50,000 rows per year, ~5-15 MB output file.
+  Comfortable for Excel.
+- Excel row limit = 1,048,576. ~250-400 employees × 8 rows × ~50 weeks per
+  year ≈ 80-160k rows per year — well within limits.
+- Combined output across 4 years would be ~200k rows total. Still openable,
+  but per-year files give faster iteration if the manager flags issues.
+
+### Performance
+- Serial extraction is **~1.5-2.5 sec/workbook** (sample2: 63 wb in ~2-3 min).
+- Full corpus serial estimate: **4-7 hours** for ~1,500 workbooks.
+- The `multiprocessing.Pool` task in §9 item 1 becomes high-leverage at this
+  scale — with 4-8 cores would drop to ~30-60 min total. Not yet implemented;
+  worth doing before the next full-corpus rerun.
+- **Don't run multiple extractions in parallel on the same machine** unless
+  you have 16+ GB RAM free. openpyxl loads each workbook fully into memory
+  (data-only mode reads the whole sheet); some workbooks are 50+ MB each.
+
+### Verification
+- Run the audit + cell-by-cell feedback comparator **per year**. Per-year
+  feedback files keep the comparison tractable and let the manager review
+  in chunks.
+- If a single year extraction crashes mid-run, the extractor processes
+  workbooks serially and writes the output only at the end — there's no
+  partial recovery. Investigate the failing workbook and rerun. (Adding
+  incremental processing is in §9 item 3.)

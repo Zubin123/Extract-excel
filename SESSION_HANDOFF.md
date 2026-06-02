@@ -159,8 +159,9 @@ What 100% looks like for sample2:
 
 ## 6. Large-dataset storage recommendation (next workload)
 
-User asked where to put 4 year folders (~2-3 GB total). Recommendation
-given:
+User asked where to put 4 year folders. Revised scale: **~1-1.4 GB per
+year uncompressed, ~4-5.6 GB total**; estimated ~250-500 workbooks per
+year, ~1,000-2,000 total. Recommendation given:
 
 - **Put data outside the repo working tree.** Even gitignored, `git status`
   walks the tree; 2-3 GB adds inode-stat latency to every git command.
@@ -176,8 +177,12 @@ given:
   Excel; per-year files stay openable. ~80-160k rows per year, well within
   Excel's 1M row limit.
 - **Parallelization not yet implemented.** §9 item 1 — `multiprocessing.Pool`
-  over workbooks is a 1-day task for ~10× speedup. Current single-process
-  estimate: ~4h per 5,000 files. Plan accordingly for multi-year runs.
+  over workbooks is a 1-day task for ~5-10× speedup. Current single-process
+  estimate at the revised scale: **4-7 hours for the full corpus** (~1,500
+  workbooks). With 4-8 cores in parallel: ~30-60 min total.
+- **Memory pressure warning:** openpyxl loads each workbook fully into
+  memory; some workbooks may be 50+ MB. Don't run multiple extractions
+  in parallel on the same machine unless 16+ GB RAM free.
 
 Now in CLAUDE.md as §16.
 
