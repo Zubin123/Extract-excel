@@ -154,9 +154,14 @@ def check_date_sequence(day_rows: list[dict]) -> list[str]:
         if not s:
             parsed.append(None)
             continue
-        try:
-            dt = datetime.strptime(s, "%m/%d/%y")
-        except (ValueError, TypeError):
+        dt = None
+        for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except (ValueError, TypeError):
+                continue
+        if dt is None:
             issues.append(f"[CHECK] {r['Day']} Date {s!r} not parseable")
             parsed.append(None)
             continue

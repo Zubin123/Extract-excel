@@ -41,11 +41,15 @@ Extract-excel/
 │   ├── WE 01 08 22 CA GF'S - WA 4939-0899-6263_1.xlsx   ← baseline input (tracked)
 │   ├── Header Template New_Rev 1.xlsx                    ← output column template (tracked)
 │   ├── sample/                                           ← NOT in git; ship via OneDrive
-│   └── sample1/                                          ← NOT in git; ship via OneDrive
-└── output/
-    ├── corpus_v5.xlsx              ← authoritative output, manager-validated (gitignored)
-    ├── phase2_corpus_v2.xlsx       ← legacy 40-file corpus result (tracked, stale)
-    └── probe_report.xlsx           ← latest probe scan output (tracked)
+│   ├── sample1/                                          ← NOT in git; ship via OneDrive
+│   └── sample2/                                          ← NOT in git; 63 wb, 5 WE folders, 2023 weeks
+├── output/
+│   ├── corpus_v5.xlsx              ← sample/sample1 manager-validated (gitignored)
+│   ├── corpus_sample2_v3.xlsx      ← sample2 manager-validated (gitignored)
+│   ├── phase2_corpus_v2.xlsx       ← legacy 40-file corpus result (tracked, stale)
+│   └── probe_report.xlsx           ← latest probe scan output (tracked)
+├── corpus_sample2 - Feedback.xlsx  ← manager-annotated truth for sample2 (gitignored, in repo root)
+└── phase2_corpus_v4 - Feedback.xlsx ← manager-annotated truth for sample/sample1 (gitignored)
 ```
 
 When starting on a new machine, copy `data/sample/` and `data/sample1/` from
@@ -126,7 +130,7 @@ Severity legend in QA_Flag strings:
 
 ---
 
-## 5. Current state (2026-05-29, manager-validated, ready for new datasets)
+## 5. Current state (2026-06-02, sample2 manager-validated)
 
 **Guiding principle (THE rule):** extract every output field by **finding its
 label** in the source. No fixed cell addresses outside structural invariants.
@@ -135,46 +139,54 @@ No per-family branching. If a field's label is present → extract it; if absent
 structural guarantee (the arithmetic sum-cross-check; date row = day-label
 row − 1; the output-schema column list). Never emit a guessed value.
 
-**Authoritative output:** `output/corpus_v5.xlsx` (local-only, gitignored).
-Manager has reviewed and accepted this output.
+**Authoritative outputs:**
+- `output/corpus_v5.xlsx` — sample/sample1 (2022 source), manager-accepted.
+- `output/corpus_sample2_v3.xlsx` — sample2 (2023 weeks), validated against
+  `corpus_sample2 - Feedback.xlsx`. **13 of 17 fields at 100%**.
 
-### Final result vs manager's `phase2_corpus_v4 - Feedback.xlsx` (the truth)
+### Final result vs `corpus_sample2 - Feedback.xlsx` (annotated truth)
 | Field | Match rate |
 |---|---|
-| Employee Name, EE ID, WC State, ST | **100%** |
-| Start / Lunch Out / Lunch In / Stop | **100%** |
-| RT, OT, DT, PD, 4D, 4A, HP, Total Hours | **100%** |
-| PTO | 99.2% (1 cell: Wirth MON; source = 19.98, manager rounded to 20.00 — faithful to source) |
+| WC State, ST, Date | **100%** |
+| Total Hours | **100%** |
+| RT, OT, DT, PD, 4D, 4A, PTO, HP, PP | **100% each** |
+| Start, Lunch In | 99.6% |
+| Lunch Out, Stop | 99.1% |
 
-**15 of 16 fields at 100%.** The single 0.8% miss is a rounding choice in the
-manager's expected output, not an extraction error. Verified by
-`scripts/compare_v4_feedback.py` (cell-by-cell against the manager's
-expected block in `phase2_corpus_v4 - Feedback.xlsx`).
+The Start/Lunch Out/Lunch In/Stop misses (13–29 cells per column out of 3,202)
+are not data errors — they are a layout-interpretation difference on
+~13 employees where the source has only Start + one mid-time cell with no
+Stop, and the manager places that mid-time in the Stop column while we keep
+the source positions faithfully. Not flagged in any feedback round so far;
+leaving as source-faithful unless explicitly requested.
 
-### Run shape
-- 290 employee sheets extracted (260 standard + 11 shifted + 19 Field Mechanic)
-- 281 PASS / 9 REVIEW / 0 FAIL
-- 199 sheets dropped by the empty-employee filter (no hours + no time entries)
-- 41 on `Unmatched_Sheets` (unfilled templates — visible, not silently dropped)
+### Earlier validation vs `phase2_corpus_v4 - Feedback.xlsx` (sample/sample1)
+**15 of 16 fields at 100%** (single 0.8% miss = Wirth PTO 19.98 vs manager-
+rounded 20.00). Confirmed by `scripts/compare_v4_feedback.py`.
 
-### Independent audit (`scripts/audit_v4.py`)
-- Pay-type grand totals match source: **283/290** (the 7 deltas are source-data
-  inconsistencies — manager workarounds where holiday hours were hand-entered
-  into a positionally-wrong grand-total cell; our label-driven output is
-  correct, the source positional check is what's misleading)
-- WC State / ST match: **290/290** (incl. all 19 FM sheets via label discovery)
-- Suspicious values (negative / >24h): **0**
-- 64 source `#VALUE!` Total Hours correctly recovered by summing day rows
+### Run shape (sample2, current)
+- 63 workbooks → 741 employee sheets extracted
+- 434 PASS / 307 REVIEW / 0 FAIL (most REVIEWs = informational anchor flags)
+- 303 dropped by empty-employee filter
+- 66 on `Unmatched_Sheets` (unfilled templates — visible)
+
+### Independent audit (`scripts/audit_v4.py`, sample2)
+- Pay-type grand totals match source: **735/741**
+- WC State / ST: **733/741** — 8 mismatches are the per-day resolver picking
+  the line-item-with-hours value (working as designed for Hilyard/Driessen)
+- 237 source `#VALUE!` Total Hours correctly recovered
+- 12 suspicious values (11 negative RT, 1 negative 4A) — faithful to source
 
 ### History (briefly)
 - v2 baseline (438/438 PASS) was *silently wrong* on 13 sheets — WC State read
   `'N'` from the FSL column. Header-label anchors fixed that.
-- v3 feedback (208 annotations) all resolved by header-label resolver + Hall
-  `employee_alt_layout` + empty-name `employee_placeholder`.
-- v4 + label-driven everything (commits `00af7f1`, `a6bae9a`): Field Mechanic
-  family extracted, PD/4D/4A added to the pay-type regex, all 8 output pay-
-  type columns resolved per-sheet by the labels in the header row.
-- `Case TUE RT = 8.0` and `Case TOTALS RT = 32.0` ✓ (original spec checks).
+- v3 feedback (208 annotations) resolved by header-label resolver + Hall
+  `employee_alt_layout` + `employee_placeholder`.
+- v4 + label-driven (commits `00af7f1`, `a6bae9a`): Field Mechanic family,
+  PD/4D/4A in regex, all 8 pay-types label-driven per sheet.
+- **sample2 fixes (commit `9b5bc8c`, 2026-06-02)** — see §14 for the full
+  list of bugs closed.
+- `Case TUE RT = 8.0` and `Case TOTALS RT = 32.0` ✓.
 
 ---
 
@@ -374,6 +386,18 @@ differ. The expected workflow:
 - ✅ Numeric output rendered as `'0.00'` strings matching feedback format
 - ✅ **All pay-type columns label-driven per sheet** (closes silent
   position-drift class for RT/OT/DT/PD/4D/4A/PTO/HP)
+- ✅ **sample2 feedback (commit `9b5bc8c`, 2026-06-02)** — see §14:
+  - Per-day WC State / ST from the line-item with worked hours (Hilyard /
+    Driessen multi-state weeks)
+  - PP token + Rancho Runners family (5-col stride, bare-suffix day-1)
+  - Pay-totals row prefers the summing row in multi-line-item sheets
+    (Federline DT/PD per day now populates)
+  - `#VALUE!` Total Hours falls back to the row below (Tweed FRI = 8.00)
+  - Date format `MM/DD/YYYY` (+ `qa.check_date_sequence` updated to parse
+    both 2- and 4-digit years)
+  - Zero pay-type cells render blank (manager rule)
+  - Time cells written as `datetime.time` objects, not strings
+  - Typo / unknown-label `[CHECK]` flag (Morgan `DT22` no longer silent)
 
 ### Still open
 1. **No parallelization.** Single-process; 5,000 files take ~4h sequential.
@@ -442,7 +466,9 @@ differ. The expected workflow:
 - **Reference sheets are detected structurally, not by name list.**
 - **When adding a new field anchor, use `resolve_anchor_cell` with a header label** — don't read fixed cells like `G13` directly. Add `cell` + `header_row` + `header_label` to the YAML profile.
 - **`employee_placeholder` sheets must leave Employee Name blank** — never use the sheet tab name as a fallback. The sheet name isn't reliably the employee's real name.
-- **Label-driven extraction is THE rule for all pay-types** (RT/OT/DT/PD/4D/4A/PTO/HP). Don't add positional reads to `extract_sheet`. New pay-type tokens get added to `anchors.PAYTYPE_DAY_RE`, not to extract code.
+- **Label-driven extraction is THE rule for all pay-types** (RT/OT/DT/PD/4D/4A/PTO/HP/PP). Don't add positional reads to `extract_sheet`. New pay-type tokens get added to `anchors.PAYTYPE_DAY_RE`, not to extract code.
+- **WC State / ST is per-day, not per-employee.** When a sheet has multiple line items with different state codes, each day row carries the state of the line item that owns that day's hours. Use `resolve_state_per_day_from_line_items`, not `resolve_anchor_cell`, for these fields.
+- **Bare-suffix pay-type tokens (`PP`, `PTO`, `HP`) are only day-1 inside the day-1 block.** Outside that block they're weekly-totals headers and must be skipped. The bug class that hits when this is ignored: bare `PTO`/`HP` at cols 50+ silently overrides legitimate `PTO1`/`HP1` mappings.
 - **Compare against the manager's feedback file as the source of truth.** `Overall=PASS` in QA_Summary is a derived self-check, not validation. The cell-by-cell comparator (`compare_v4_feedback.py`) is the real accuracy metric.
 
 ---
@@ -454,26 +480,34 @@ OneDrive corrupts git pack files).
 
 When resuming, read in this order:
 1. This file §5 (current state), §6.4 (the label-driven rule), §8 (new-dataset
-   workflow), §13 (verification recipe).
+   workflow), §13 (verification recipe), §14 (sample2 fix log), §15
+   (discussion notes), §16 (large-dataset handling).
 2. `SESSION_HANDOFF.md` — most recent session's notes, including any
    in-flight context.
 3. `src/anchors.py` — discovery primitives. The functions that matter:
-   `discover_paytype_columns_by_label`, `find_field_mechanic_header_row`,
-   `find_fm_job_col`, `resolve_anchor_cell`, `classify_sheet`.
+   `discover_paytype_columns_by_label`, `discover_field_mechanic_paytype_cols`,
+   `resolve_state_per_day_from_line_items`, `resolve_pay_totals_row`,
+   `find_field_mechanic_header_row`, `find_fm_job_col`, `resolve_anchor_cell`,
+   `classify_sheet`.
 4. `src/extract.py` — `extract_sheet`, `extract_field_mechanic_sheet`,
-   `_format_numeric_cells`, `_drop_empty_employees`, `process_workbook`.
-5. `output/corpus_v5.xlsx` — the authoritative manager-validated output.
+   `_format_numeric_cells`, `_drop_empty_employees`, `process_workbook`,
+   `_write_excel` (the time-cell post-write).
+5. `output/corpus_v5.xlsx` and `output/corpus_sample2_v3.xlsx` — the two
+   manager-validated outputs.
+6. `corpus_sample2 - Feedback.xlsx` (repo root) — annotated truth for sample2.
 
-**Git state at last update (2026-05-29):**
+**Git state at last update (2026-06-02):**
 - Branch: `main`
-- HEAD: `4c5245e` "Fix typo: corpus_vs.xlsx -> corpus_v5.xlsx"
+- HEAD: `9b5bc8c` "Resolve sample2 feedback: per-day WC/ST, PP family, blank zeros, MM/DD/YYYY dates"
 - Remote: https://github.com/Zubin123/Extract-excel.git
 - Recent commits worth reading in order:
   - `64367e3` header-verified anchors + Hall + placeholders (Phase 3)
   - `a90cd9c` empty-employee drop filter + empty-value flagging
   - `00af7f1` Field Mechanic extraction
-  - `a6bae9a` **all pay-types label-driven** (the architecture commit)
+  - `a6bae9a` all pay-types label-driven (sample/sample1 architecture commit)
   - `8b67410`, `4c5245e` rename to `corpus_v5.xlsx`
+  - `211e330` 2026-05-29 docs refresh
+  - `9b5bc8c` **sample2 feedback resolved** (the current head — see §14)
 
 ---
 
@@ -550,3 +584,145 @@ The mismatches sort cleanly into a small number of root causes:
 
 Never accept a "PASS that doesn't match the feedback" — the feedback file
 is the ground truth, the in-output QA_Summary is a derived signal.
+
+
+---
+
+## 14. sample2 fixes (commit `9b5bc8c`, 2026-06-02)
+
+Manager raised six items on the first sample2 extract; this section captures
+what each one was and the structural fix shipped. Read this if a future
+feedback round reopens any of these classes.
+
+### #1 — WC State / ST per-day from line-item-with-hours
+**Symptom:** Hilyard / Delair / Knowland (PacifiCorp 01/22/23) and Driessen
+(PacifiCorp 01/01/23) had multi-state weeks (CA most days, OR one day).
+Old code took the *first non-empty* value under the WC STATE header — a
+single code per employee — losing the OR/CA split.
+
+**Fix:** `anchors.resolve_state_per_day_from_line_items` walks every line
+item below the header, sums each day-block on that row, and for any day
+with hours > 0 records that line item's WC/ST value. `extract_sheet` and
+`extract_field_mechanic_sheet` look up `per_day[day_idx]` when emitting
+each day row, falling back to the first non-empty value for days with no
+hours (weekends). Closes the Hilyard Thursday `OR` and Driessen TUE-FRI
+`OR` cases. **Never assumes a single state per employee again.**
+
+### #2/#3/#4 — PP token + Rancho Runners family without breaking standard sheets
+**Symptom:** Adding `PP` to the regex (for Rancho Runners, where the day-1
+column is bare `PP` not `PP1`) broke Adam Peart and Rancho Office: bare
+`PTO` / `HP` labels in the grand-totals summary area (cols 50+) were being
+interpreted as day-1 labels and *overrode* the legitimate `PTO1`/`HP1`
+mappings, swapping PTO and HP for day 1.
+
+**Fix:** `anchors.PAYTYPE_DAY_RE_OPTIONAL_SUFFIX` accepts bare tokens, BUT
+`discover_field_mechanic_paytype_cols` only treats a bare token as day 1
+when its column sits *inside the day-1 block*. The day-1 block is derived
+from the day-label row (find MON & TUE columns; gap = block width).
+Bare tokens outside the day-1 block are skipped — they are weekly summary
+headers, not per-day labels.
+
+### #5 — Pay-totals row selection for multi-line-item sheets
+**Symptom:** Federline (storm week, 3 line-item rows + 1 sum row) and Tweed
+were reading from one line-item row instead of the summing row. Days the
+line item didn't cover (MON, SAT, SUN for Federline) showed as 0.
+
+**Fix:** `anchors.resolve_pay_totals_row` ranks candidate rows by populated
+day-cell coverage and tolerates 1 cross-check mismatch on the winning row.
+The summing row always has the highest coverage; it wins even when its
+grand-total cell disagrees with its day-sum due to source-data
+inconsistency (Federline RT 32 vs grand-total 35 = manager hand-correction).
+
+### #6 — Total Hours `#VALUE!` fallback
+**Symptom:** Tweed FRI 01/27/2023 showed TH=0.00. Source row 9 (Total Hours)
+FRI cell = `#VALUE!` formula error; row 10 (Time Sheet Hours label) FRI = 8.
+
+**Fix:** In `extract_sheet`, when the Total Hours cell is a `#`-prefixed
+error string, fall back to the cell one row below (the recovered value).
+
+### #7 — Date format MM/DD/YYYY
+**Symptom:** Output had `12/26/22`; manager wants `12/26/2022`.
+**Fix:** `fmt_date` uses the 4-digit-year strftime directive instead of the
+2-digit one.
+**Companion fix in qa.py:** `check_date_sequence` was parsing dates with
+`%m/%d/%y` only — after the format change every day row got a `[CHECK] Date
+'12/26/2022' not parseable` flag and the entire dataset went REVIEW. Fixed
+by trying `%m/%d/%Y` first, then falling back to `%m/%d/%y` for backwards
+compatibility. Any new date-format change needs the same dual-format parse
+treatment.
+
+### #8 — Blank zero pay-type cells
+**Symptom:** Output rendered zero pay-type values as `'0.00'`; manager wants
+blank cells (`None`) when there's no real value.
+**Fix:** `_format_numeric_cells.fmt_nonzero_blank` returns `None` for zero/
+blank inputs on day rows. Total Hours still renders `'0.00'` so the zero-hour
+row remains visible. TOTALS rows keep their numeric grand totals.
+
+### #9 — Time cells as `datetime.time` objects, not strings
+**Symptom:** Pandas serializes `datetime.time` to `'07:00:00'` strings on
+write; manager wants raw time-of-day values so Excel renders them as times.
+**Fix:** Snapshot the four clock columns before pandas writes, then overwrite
+those cells with `datetime.time` values via openpyxl post-write and set
+`number_format = "h:mm AM/PM"`.
+
+### #10 — Typo / unknown-label `[CHECK]` flag
+**Symptom:** Morgan sheet had `'DT22'` and `'DT32'` typos in the PD2/PD3
+slots. The strict regex skipped them silently; the underlying cell value
+(if any) was lost without a flag.
+**Fix:** `discover_paytype_columns_by_label` emits `[CHECK] header U12='DT22'
+looks like a pay-type label but doesn't match the day-1..7 form ...` whenever
+a day-block header cell starts with a known pay-type prefix but fails the
+strict regex. Surfaces silent data loss instead of hiding it.
+
+---
+
+## 15. Discussion notes from the sample2 round
+
+These are the design decisions the manager and Claude reached that future
+sessions should preserve:
+
+- **`4S` exists but isn't per-day.** Found at Spaulding template col 57, in
+  the grand-totals summary row alongside `1, 3, 2, HP, PTO, Total`. Not added
+  to the output schema (manager said skip for now). If a future dataset shows
+  per-day `4S1..4S7` labels, add `4S` to `PAYTYPE_DAY_RE` and the output
+  columns.
+- **`12, 4A22, 4A24, 4A25, 4D52, DT22, DT32, 3.5` are typos.** Manager
+  confirmed during sample2 review. Don't add to the regex; the typo `[CHECK]`
+  flag (#10 above) surfaces them.
+- **Manager comments on sample2 feedback file:** 25 annotations across 4
+  categories — "Full Excel Extraction missed" (17 = Manuals 4 employees),
+  "DT entry was missed" (3 = Federline), "PD entry was missed" (4 = Federline),
+  "Total Hours was missing" (1 = Tweed FRI 01/27/23). All resolved.
+- **Per-day WC State is NOT "all distinct codes joined with `;`".** Initial
+  interpretation was wrong. Manager wants the per-row code of the line item
+  that owns that day's hours. Row-level, not employee-level.
+- **The `OFF` sentinel in the Start cell is NOT a hours-zeroing signal.** When
+  Start = `'OFF'`, the day may still have legitimate hours filed under a pay-
+  type cell or recovered from `Time Sheet Hours`. The flag we emit is
+  informational only.
+- **Time cells without lunch — open interpretation question.** ~13 employees
+  have rows with Start + one mid-time value (Lunch Out filled, Lunch In + Stop
+  blank). Manager's feedback file places that mid-time in the Stop column;
+  we keep it in Lunch Out (source-faithful). Not yet flagged by the manager
+  as a bug; left as source-faithful unless explicitly confirmed.
+
+---
+
+## 16. Large-dataset handling (years 2022, 2024, 2025, 2026)
+
+When processing the full corpus (500-800 MB per year folder, ~2-3 GB total):
+
+- **Don't put it in the repo working tree.** Git `status` walks the working
+  tree even when files are gitignored. Use an external path like
+  `D:\timesheet-data\2024\` and pass it via CLI:
+  `.venv\Scripts\python.exe src\extract.py "D:\timesheet-data\2024" --out output\corpus_2024.xlsx`
+- **Avoid OneDrive / cloud-synced paths.** Same corruption risk that motivated
+  moving the working tree off OneDrive (CLAUDE.md §12). External SSD over
+  USB is fine; mounted SharePoint / OneDrive is not.
+- **One output workbook per year.** Single mega-output gets unwieldy in Excel.
+  Per-year (`corpus_2024.xlsx`) keeps each file openable.
+- **Single-process is the bottleneck.** §9 item 1 notes a ~1-day
+  `multiprocessing.Pool` task would give ~10× speedup. Not done yet.
+- **Excel row limit = 1,048,576.** At ~200-400 employees × 8 rows × ~50 weeks
+  per year = 80-160k rows per year — well within limits. If a single year
+  ever exceeds, switch to CSV/Parquet output (§9 item 2).
