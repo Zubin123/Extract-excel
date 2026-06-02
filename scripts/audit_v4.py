@@ -32,7 +32,7 @@ from anchors import (  # noqa: E402
 )
 
 TOL = 0.01
-OUT = ROOT / "output" / "phase2_corpus_v4.xlsx"
+OUT = ROOT / "output" / "corpus_sample2_v2.xlsx"
 DATA = ROOT / "data"
 
 
@@ -138,7 +138,7 @@ def audit():
             if fm_hr is not None:
                 grid, day_idxs, _pts = discover_field_mechanic_paytype_cols(ws, fm_hr)
                 last_row = ws.max_row or fm_hr
-                fm_pts = ["RT", "OT", "DT", "PTO", "HP"]
+                fm_pts = ["RT", "OT", "DT", "PTO", "HP", "PP"]
                 src_week = {pt: 0.0 for pt in fm_pts}
                 job_col = find_fm_job_col(ws, fm_hr)
                 def _is_line_item(r):

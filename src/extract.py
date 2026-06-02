@@ -33,6 +33,8 @@ from anchors import (
     find_label_in_grid as anchors_find_label_in_grid,
     resolve_anchor_cell,
     resolve_pay_totals_row,
+    resolve_state_for_hours_row,
+    resolve_state_per_day_from_line_items,
     select_profile,
     sheet_has_day_grid,
 )
@@ -62,27 +64,28 @@ def fmt_date(val) -> str:
     if val is None:
         return ""
     if isinstance(val, datetime):
-        return val.strftime("%m/%d/%y")
+        return val.strftime("%m/%d/%Y")
     return str(val)
 
 
-def fmt_time(val) -> str:
+def fmt_time(val):
+    """Return a time-of-day value in the same shape the manager's feedback
+    file uses: a ``datetime.time`` instance for real time cells, ``None`` for
+    blanks. The previous behavior formatted to '7:00 AM' strings; the manager
+    requested raw time values so downstream tooling can re-format them.
+    """
     if val is None:
-        return ""
-    if isinstance(val, datetime):
-        fmt = "%#I:%M %p" if sys.platform == "win32" else "%-I:%M %p"
-        return val.strftime(fmt)
+        return None
     if isinstance(val, time):
-        dt = datetime.combine(datetime.today(), val)
-        fmt = "%#I:%M %p" if sys.platform == "win32" else "%-I:%M %p"
-        return dt.strftime(fmt)
+        return val
+    if isinstance(val, datetime):
+        return val.time()
     if isinstance(val, float) and 0.0 <= val < 1.0:
         total_minutes = round(val * 24 * 60)
         hours, minutes = divmod(total_minutes, 60)
-        period = "AM" if hours < 12 else "PM"
-        display_hour = hours % 12 or 12
-        return f"{display_hour}:{minutes:02d} {period}"
-    return ""
+        # Wrap 24:00 to 00:00 just in case rounding pushes it over.
+        return time(hour=hours % 24, minute=minutes)
+    return None
 
 
 def coerce_hours(val) -> float:
@@ -161,6 +164,11 @@ def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
         ee_id = ws[anchors["ee_id"]].value
     wc_state_val, wc_status, _ = resolve_anchor_cell(ws, anchors.get("wc_state"))
     st_val,       st_status, _ = resolve_anchor_cell(ws, anchors.get("st"))
+    # If the sheet has multiple line-items (different WC/ST per row), the
+    # standard resolver returns the first non-empty cell which may belong
+    # to a zero-hours line. Override with the value of the row that has
+    # the most worked hours — manager's rule. Header row + day cols are
+    # discovered below; we redo this resolution after we have them.
     wc_state = wc_state_val if wc_state_val is not None else ""
     st       = st_val       if st_val       is not None else ""
 
@@ -204,19 +212,41 @@ def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
     paytype_header_row = header_loc[0] if header_loc else None
     day_start_idx_list = [col_letter_to_index(c) for c in day_start_cols]
     paytype_grid: dict[tuple[int, str], int] = {}
+    # Per-day WC State / ST overrides. Empty when this sheet isn't multi-
+    # line-item; the existing wc_state / st value is used for all rows.
+    wc_per_day: dict[int, object] = {}
+    st_per_day: dict[int, object] = {}
+    pay_block_width = db.get("pay_block_width", 6)
     if paytype_header_row is not None:
         paytype_grid, discovery_issues = discover_paytype_columns_by_label(
             ws, paytype_header_row, day_start_idx_list
         )
         anchor_issues.extend(discovery_issues)
+        # Per-day WC State / ST: for each day, take the state code from the
+        # line-item row that carries that day's hours. Manager's rule for
+        # multi-state sheets (Hilyard / Delair / Knowland — CA most days,
+        # OR on the day worked at OR). Single-state sheets resolve all
+        # 7 days to the same value, which equals the prior behavior.
+        wc_per_day, wc_fallback = resolve_state_per_day_from_line_items(
+            ws, "WC STATE", paytype_header_row, day_start_idx_list,
+            pay_block_width=pay_block_width,
+        )
+        st_per_day, st_fallback = resolve_state_per_day_from_line_items(
+            ws, "ST", paytype_header_row, day_start_idx_list,
+            pay_block_width=pay_block_width,
+        )
+        if wc_fallback is not None:
+            wc_state = wc_fallback
+        if st_fallback is not None:
+            st = st_fallback
     else:
         anchor_issues.append(
             "[CHECK] WC STATE header not found — falling back to YAML pay-type positions"
         )
 
     # Fallback: positional reading from YAML, only when label discovery yielded
-    # nothing for a day. We always emit the 8 canonical output columns.
-    OUTPUT_PAY_TYPES = ["RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP"]
+    # nothing for a day. We always emit the canonical output columns.
+    OUTPUT_PAY_TYPES = ["RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP", "PP"]
 
     rows = []
 
@@ -229,6 +259,15 @@ def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
         lunch_in   = ws.cell(row=t_rows["Lunch In"],  column=start_idx).value
         stop       = ws.cell(row=t_rows["Stop"],      column=start_idx).value
         total_hrs  = ws.cell(row=total_hours_row,     column=start_idx).value
+        # When the 'Total Hours' cell is a #VALUE! formula error, fall back to
+        # the row immediately below (label 'Time Sheet Hours') — the source
+        # template carries a recovered numeric value there. Without this, days
+        # with #VALUE! in the totals cell show 0.00 even when the real hours
+        # are available one row down (Tweed FRI 01/27/23 = 8 case).
+        if isinstance(total_hrs, str) and "#" in total_hrs:
+            below = ws.cell(row=total_hours_row + 1, column=start_idx).value
+            if isinstance(below, (int, float)):
+                total_hrs = below
 
         # Read each output pay-type from its label-discovered column.
         day_hours = {pt: 0.0 for pt in OUTPUT_PAY_TYPES}
@@ -260,6 +299,10 @@ def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
         flag_parts = [p for p in [base_flag if base_flag != "OK" else None, *order_issues] if p]
         qa_flag = "; ".join(flag_parts) if flag_parts else "OK"
 
+        # Per-day WC/ST: prefer the line-item value for this day if known,
+        # otherwise fall back to the employee-level value (first non-empty).
+        wc_day = wc_per_day.get(day_idx, wc_state)
+        st_day = st_per_day.get(day_idx, st)
         rows.append({
             "Folder Name":   folder_name,
             "Box Name":      box_name,
@@ -267,8 +310,8 @@ def extract_sheet(ws, profile: dict, pay_totals_row: int, folder_name: str,
             "Sheet Name":    sheet_name,
             "Employee Name": employee_name,
             "EE ID":         ee_id,
-            "WC State":      wc_state,
-            "ST":            st,
+            "WC State":      wc_day,
+            "ST":            st_day,
             "Date":          fmt_date(date_val),
             "Day":           day_label,
             "Start":         fmt_time(time_start),
@@ -418,6 +461,7 @@ def extract_sheet_no_grid(ws, folder_name: str, box_name: str,
             **{pt: "" for pt in DEFAULT_PAY_TYPES},
             "PTO": "",
             "HP":  "",
+            "PP":  "",
             "QA_Flag": totals_flag if day_label == "TOTALS" else base_flag,
         }
         rows.append(row)
@@ -484,6 +528,37 @@ def extract_field_mechanic_sheet(ws, header_row: int, folder_name: str,
     day_row_info = find_day_label_row(ws)
     grid, day_indices, _pts_seen = discover_fm_paytype_cols(ws, header_row)
 
+    # Per-day WC/ST: same rule as the standard path. For Field Mechanic
+    # we need the day-block column list (derived from `grid` — the unique
+    # day-1 column for each pay-type tells us where each block starts).
+    # Pay-block width is variable in FM; reuse a conservative scan.
+    fm_day_cols: dict[int, int] = {}
+    for (di, _pt), col in grid.items():
+        if di not in fm_day_cols or col < fm_day_cols[di]:
+            fm_day_cols[di] = col
+    fm_day_cols_sorted = [fm_day_cols[i] for i in sorted(fm_day_cols.keys())]
+    wc_per_day_fm: dict[int, object] = {}
+    st_per_day_fm: dict[int, object] = {}
+    if fm_day_cols_sorted:
+        # Estimate per-day-block width as the gap between consecutive day
+        # columns; the standard family uses 6, Rancho Runners 5.
+        if len(fm_day_cols_sorted) >= 2:
+            fm_block_width = fm_day_cols_sorted[1] - fm_day_cols_sorted[0]
+        else:
+            fm_block_width = 6
+        wc_per_day_fm, wc_fb = resolve_state_per_day_from_line_items(
+            ws, "WC STATE", header_row, fm_day_cols_sorted,
+            pay_block_width=fm_block_width,
+        )
+        st_per_day_fm, st_fb = resolve_state_per_day_from_line_items(
+            ws, "ST", header_row, fm_day_cols_sorted,
+            pay_block_width=fm_block_width,
+        )
+        if wc_fb is not None and (wc_state == "" or wc_state is None):
+            wc_state = wc_fb
+        if st_fb is not None and (st == "" or st is None):
+            st = st_fb
+
     # JOB column — only rows with a job code are real line items. Rows below
     # without a JOB value are echo/import-shadow rows that duplicate per-day
     # pay-type cells; summing them double-counts. If we can't find the JOB
@@ -532,7 +607,7 @@ def extract_field_mechanic_sheet(ws, header_row: int, folder_name: str,
 
     last_row = ws.max_row or header_row
     rows: list[dict] = []
-    pay_out_types = ["RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP"]
+    pay_out_types = ["RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP", "PP"]
     week_totals = {pt: 0.0 for pt in pay_out_types}
     week_total_hours = 0.0
     any_total_hours = False
@@ -545,7 +620,7 @@ def extract_field_mechanic_sheet(ws, header_row: int, folder_name: str,
         # Only sum rows that ARE line items (JOB column populated) — echo rows
         # below the line-item block duplicate per-day pay-type cells.
         day_pay = {pt: 0.0 for pt in pay_out_types}
-        for pt in ("RT", "OT", "DT", "PTO", "HP"):
+        for pt in ("RT", "OT", "DT", "PTO", "HP", "PP"):
             col = grid.get((day_idx, pt))
             if col is not None:
                 s = 0.0
@@ -576,14 +651,15 @@ def extract_field_mechanic_sheet(ws, header_row: int, folder_name: str,
             "Folder Name": folder_name, "Box Name": box_name,
             "Excel Name": excel_name, "Sheet Name": sheet_name,
             "Employee Name": employee_name, "EE ID": ee_id,
-            "WC State": wc_state, "ST": st,
+            "WC State": wc_per_day_fm.get(day_idx, wc_state),
+            "ST": st_per_day_fm.get(day_idx, st),
             "Date": fmt_date(date_val), "Day": day_label,
             "Start": fmt_time(time_start), "Lunch Out": fmt_time(lunch_out),
             "Lunch In": fmt_time(lunch_in), "Stop": fmt_time(stop),
             "Total Hours": total_hrs,
             "RT": day_pay["RT"], "OT": day_pay["OT"], "DT": day_pay["DT"],
             "PD": 0.0, "4D": 0.0, "4A": 0.0,
-            "PTO": day_pay["PTO"], "HP": day_pay["HP"],
+            "PTO": day_pay["PTO"], "HP": day_pay["HP"], "PP": day_pay["PP"],
             "QA_Flag": "OK",
         })
 
@@ -601,6 +677,7 @@ def extract_field_mechanic_sheet(ws, header_row: int, folder_name: str,
         "DT": round(week_totals["DT"], 4),
         "PD": 0.0, "4D": 0.0, "4A": 0.0,
         "PTO": round(week_totals["PTO"], 4), "HP": round(week_totals["HP"], 4),
+        "PP": round(week_totals["PP"], 4),
         "QA_Flag": totals_flag,
     })
     return rows
@@ -642,52 +719,74 @@ def check_accuracy(employee_rows: list[dict], pay_types: list[str],
 
 # ── Writer ──────────────────────────────────────────────────────────────────
 
-_NUMERIC_OUTPUT_COLS = ("Total Hours", "RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP")
+_NUMERIC_OUTPUT_COLS = ("Total Hours", "RT", "OT", "DT", "PD", "4D", "4A",
+                        "PTO", "HP", "PP")
 
 
 def _format_numeric_cells(data_df: pd.DataFrame) -> pd.DataFrame:
-    """Render numeric output columns as 2-decimal strings to match the feedback
-    file's format. Zero / None on a day row becomes '0.00' (the manager treats
-    blanks as zero); TOTALS rows keep Total Hours but blank-out pay-types to
-    match the manager's expected layout. In-memory floats are preserved by
-    operating on a copy.
+    """Render numeric output columns to match the manager's expected layout:
+      - Total Hours on a day row: '0.00' for zero/missing, else 2-decimal string
+        (preserved as a visible value so the day row still reads as "no hours")
+      - Pay-type columns (RT/OT/DT/PD/4D/4A/PTO/HP/PP/4S/'12') on day rows:
+        blank when zero/missing, 2-decimal string otherwise — the manager
+        treats blank as zero and wants only the cells that carry real hours
+        to be visible.
+      - TOTALS rows: pay-type cells left as numeric grand totals (the
+        existing in-memory float survives); Total Hours formatted as 2dp.
     """
     df = data_df.copy()
     if "Day" not in df.columns:
         return df
 
-    def fmt(v):
+    def fmt_nonzero_blank(v):
+        # Zero / None / blank becomes a true blank (None) — pandas writes
+        # this as an empty cell in the output.
+        if v is None or v == "":
+            return None
+        if isinstance(v, float) and v != v:  # NaN
+            return None
+        try:
+            f = float(v)
+            if f == 0:
+                return None
+            return f"{f:.2f}"
+        except (TypeError, ValueError):
+            return v
+
+    def fmt_total_hours(v):
         if v is None or v == "":
             return "0.00"
-        if isinstance(v, float) and v != v:  # NaN
+        if isinstance(v, float) and v != v:
             return "0.00"
         try:
             return f"{float(v):.2f}"
         except (TypeError, ValueError):
-            return v  # leave non-numeric (e.g. error strings) alone
+            return v
 
     is_totals = df["Day"].astype(str).str.upper() == "TOTALS"
 
     for col in _NUMERIC_OUTPUT_COLS:
         if col not in df.columns:
             continue
-        # Cast to object so we can mix strings and numbers in the same column
-        # without pandas rejecting the assignment as a dtype violation.
         df[col] = df[col].astype(object)
         if col == "Total Hours":
-            df[col] = df[col].map(fmt)
+            df[col] = df[col].map(fmt_total_hours)
         else:
-            # Day rows: format zero/None as '0.00'; TOTALS rows: keep the
-            # numeric grand total. Manager's expected block leaves pay-type
-            # TOTALS blank; losing that data in our output costs more than
-            # the cosmetic mismatch (the comparison ignores unspecified cells).
             day_mask = ~is_totals
-            df.loc[day_mask, col] = df.loc[day_mask, col].map(fmt)
+            df.loc[day_mask, col] = df.loc[day_mask, col].map(fmt_nonzero_blank)
     return df
 
 
 def _write_excel(out_path: Path, data_df: pd.DataFrame, qa_rows: list[dict],
                  run_info: dict, unmatched: list[dict], id_conflicts: list[dict]):
+    # Preserve raw time-of-day values for the four clock columns: pandas
+    # otherwise stringifies datetime.time on write. We snapshot the column
+    # values now, format pay-type numerics, then re-apply the time values
+    # via openpyxl after pandas finishes writing.
+    time_cols = ("Start", "Lunch Out", "Lunch In", "Stop")
+    time_snapshot = {
+        col: list(data_df[col]) for col in time_cols if col in data_df.columns
+    }
     data_df = _format_numeric_cells(data_df)
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         data_df.to_excel(writer, sheet_name="Data", index=False)
@@ -700,6 +799,19 @@ def _write_excel(out_path: Path, data_df: pd.DataFrame, qa_rows: list[dict],
 
     # Data sheet colouring
     ws_data = wb["Data"]
+
+    # Restore raw time-of-day values to their cells (pandas writes time as
+    # string '07:00:00'; we want the actual datetime.time so Excel renders
+    # it as a time and the manager's diff against feedback file matches).
+    for col_name, values in time_snapshot.items():
+        col_idx = data_df.columns.get_loc(col_name) + 1
+        for r_idx, v in enumerate(values, start=2):
+            cell = ws_data.cell(row=r_idx, column=col_idx)
+            if v is None:
+                cell.value = None
+            else:
+                cell.value = v
+                cell.number_format = "h:mm AM/PM"
     qa_col_idx  = data_df.columns.get_loc("QA_Flag") + 1
     day_col_idx = data_df.columns.get_loc("Day") + 1
     for row in ws_data.iter_rows(min_row=2, max_row=ws_data.max_row):

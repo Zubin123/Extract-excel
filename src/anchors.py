@@ -33,7 +33,16 @@ ALL_DAY_TOKENS = DAY_TOKENS | DAY_TOKENS_FULL
 # The trailing digit is the day number (1=first day .. 7=last day).
 # Tokens cover every pay-type seen across all template families:
 #   RT, OT, DT, PD, 4D, 4A (standard); PTO, HP (Field Mechanic + drift variants)
-PAYTYPE_DAY_RE = re.compile(r"^(RT|OT|DT|PD|4D|4A|PTO|HP)(\d)$", re.IGNORECASE)
+PAYTYPE_DAY_RE = re.compile(r"^(RT|OT|DT|PD|4D|4A|PTO|HP|PP)(\d)$", re.IGNORECASE)
+
+# Same vocabulary but with the day-1 suffix optional — some templates
+# (Rancho Runners) drop the trailing '1' on the first day-block column,
+# writing 'PP' instead of 'PP1' while still using 'PP2'..'PP7' for later
+# days. Match group 2 is None for the suppressed-suffix form, which the
+# caller interprets as day index 0.
+PAYTYPE_DAY_RE_OPTIONAL_SUFFIX = re.compile(
+    r"^(RT|OT|DT|PD|4D|4A|PTO|HP|PP)(\d)?$", re.IGNORECASE
+)
 
 
 def col_letter_to_index(col: str) -> int:
@@ -339,15 +348,21 @@ def resolve_pay_totals_row(
     gt_idx = [col_letter_to_index(c) for c in gt_cols]
 
     max_r = min(ws.max_row or 0, scan_to)
-    matching: list[tuple[int, float]] = []   # (row, total_magnitude) — pick largest
-    near_miss: list[tuple[int, int]] = []    # (row, mismatched_pay_types)
+    # candidate: (row, total_magnitude, day_cell_coverage, mismatches)
+    candidates: list[tuple[int, float, int, int]] = []
 
     for r in range(scan_from, max_r + 1):
         gt_numeric_count = 0
         mismatches = 0
         total_magnitude = 0.0
+        day_cell_coverage = 0
         for i in range(n_pay):
             day_sum, _has_day = _pay_type_sum_across_days(ws, r, day_start_idx, i)
+            # Count populated day cells (numeric, any value incl 0) as coverage.
+            for c in day_start_idx:
+                v = ws.cell(row=r, column=c + i).value
+                if isinstance(v, (int, float)):
+                    day_cell_coverage += 1
             gt_val = ws.cell(row=r, column=gt_idx[i]).value
             gt_num = isinstance(gt_val, (int, float))
             if gt_num:
@@ -357,26 +372,30 @@ def resolve_pay_totals_row(
                 else:
                     total_magnitude += abs(float(gt_val))
 
-        # A valid totals row has all grand-total cells populated and all cross-check.
-        if gt_numeric_count == n_pay and mismatches == 0:
-            matching.append((r, total_magnitude))
-        elif gt_numeric_count >= n_pay - 1:
-            near_miss.append((r, mismatches))
+        # A row qualifies as a candidate if it has all grand-totals cells
+        # populated AND at most 1 pay-type mismatch. Strict 0-mismatch rows
+        # rank above 1-mismatch ones; among equal-strictness candidates, the
+        # row with the most populated day cells (the SUMMING row in multi-
+        # line-item sheets) wins — closes Federline / Tweed silent-zero class
+        # where row 14 (one line item) was preferred over row 25 (week sum).
+        if gt_numeric_count == n_pay and mismatches <= 1:
+            candidates.append((r, total_magnitude, day_cell_coverage, mismatches))
 
-    if matching:
-        # Prefer the row with the largest total magnitude — that's the row that
-        # actually carries the weekly totals, not an empty upstream summary row.
-        # Ties go to the latest row (typical totals row is below summary rows).
-        best_row = max(matching, key=lambda x: (x[1], x[0]))[0]
-        return best_row, "OK"
-
-    if near_miss:
-        best = min(near_miss, key=lambda x: x[1])
-        return None, (
-            f"no row passed sum cross-check; closest candidate row {best[0]} "
-            f"with {best[1]} pay-type mismatch(es)"
+    if candidates:
+        # Rank by (coverage, magnitude, later row) and tolerate one mismatch on
+        # the winning row. The summing row of a multi-line-item sheet always
+        # has the highest coverage (every day × every pay-type), even when one
+        # of its grand-totals cells disagrees due to source-data inconsistency
+        # (Federline RT 32 vs grand-total 35 case). A strict 0-mismatch
+        # upstream line-item row has much lower coverage and would otherwise
+        # win — losing the data on days it doesn't carry.
+        best = max(candidates, key=lambda x: (x[2], x[1], x[0]))
+        return best[0], "OK" if best[3] == 0 else (
+            f"OK (best candidate row {best[0]} has 1 pay-type cross-check miss — "
+            f"source data inconsistency; picked by cell-coverage)"
         )
-    return None, "no row had both day-block and grand-total numeric values"
+
+    return None, "no row had both day-block and grand-total numeric values within tolerance"
 
 
 # ── Field Mechanic discovery (label-driven; no hardcoded cells) ───────────────
@@ -480,14 +499,25 @@ def discover_paytype_columns_by_label(
     each day's start column up to (the next day's start column - 1) or,
     for the last day, a sensible bound.
     """
-    OUTPUT_TYPES = {"RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP"}
+    OUTPUT_TYPES = {"RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP", "PP"}
     grid: dict[tuple[int, str], int] = {}
     issues: list[str] = []
 
     # Compute scan extent for each day block from the day_start_cols list.
+    # For the last day, use the same stride as the previous gap so we don't
+    # spill into the grand-totals summary columns (cols 54+ on standard
+    # layouts) and surface false 'unknown header' flags for legitimate
+    # summary labels like '1', 'PTO', 'HP', 'Total'.
+    if len(day_start_cols) >= 2:
+        last_stride = day_start_cols[-1] - day_start_cols[-2]
+    else:
+        last_stride = 6
     bounds = []
     for i, start in enumerate(day_start_cols):
-        end = day_start_cols[i + 1] - 1 if i + 1 < len(day_start_cols) else start + 8
+        if i + 1 < len(day_start_cols):
+            end = day_start_cols[i + 1] - 1
+        else:
+            end = start + last_stride - 1
         bounds.append((start, end))
 
     for day_idx, (start, end) in enumerate(bounds):
@@ -495,8 +525,30 @@ def discover_paytype_columns_by_label(
             v = ws.cell(row=header_row, column=c).value
             if not isinstance(v, str):
                 continue
-            m = PAYTYPE_DAY_RE.match(v.strip().upper())
+            label_raw = v.strip()
+            label_up = label_raw.upper()
+            m = PAYTYPE_DAY_RE.match(label_up)
             if not m:
+                # Header text present but doesn't match a known pay-type label.
+                # Only flag if it LOOKS like a malformed pay-type token (starts
+                # with a known prefix and has trailing digits) — Morgan-style
+                # 'DT22' typos in the PD2 slot ate real data without warning.
+                # We can't safely route the value, but we must tell the manager.
+                looks_like_paytype = False
+                for prefix in ("RT", "OT", "DT", "PD", "4D", "4A", "PTO", "HP", "PP"):
+                    if (label_up.startswith(prefix)
+                            and len(label_up) > len(prefix)
+                            and label_up[len(prefix):].isdigit()):
+                        looks_like_paytype = True
+                        break
+                if looks_like_paytype:
+                    addr = f"{col_index_to_letter(c)}{header_row}"
+                    issues.append(
+                        f"[CHECK] header {addr}={label_raw!r} looks like a "
+                        f"pay-type label but doesn't match the day-1..7 form "
+                        f"(day {day_idx+1} block) — likely typo; value will "
+                        f"not be routed to any output field"
+                    )
                 continue
             label_pt = m.group(1).upper()
             label_day = int(m.group(2))
@@ -515,6 +567,124 @@ def discover_paytype_columns_by_label(
                 continue
             grid[(day_idx, label_pt)] = c
     return grid, issues
+
+
+def resolve_state_per_day_from_line_items(
+    ws, label: str, header_row: int, day_start_cols: list[int],
+    pay_block_width: int = 6, max_scan_rows: int = 30,
+) -> tuple[dict[int, object], object | None]:
+    """For each day, return the WC State / ST value taken from the line-item
+    row that actually carries that day's hours.
+
+    Returns (per_day, fallback) where:
+      - per_day[day_idx] = the state code (string) for line items with hours
+        on that day. Missing if no line item carries hours on that day.
+      - fallback = the first non-empty value in the label column, used for
+        days with no hours.
+
+    The manager's rule: each output row's WC State / ST should reflect the
+    work-state of THAT day's line item, not a single per-employee value.
+    Hilyard 01/19/23 worked at OR (one line item); other days at CA.
+    """
+    label_up = label.strip().upper()
+    label_col = None
+    cmax = min(ws.max_column or 0, 80)
+    for c in range(1, cmax + 1):
+        v = ws.cell(row=header_row, column=c).value
+        if isinstance(v, str) and v.strip().upper() == label_up:
+            label_col = c
+            break
+    if label_col is None:
+        return {}, None
+
+    last_row = min((ws.max_row or header_row) + 1, header_row + max_scan_rows)
+    per_day: dict[int, object] = {}
+    fallback: object | None = None
+
+    for r in range(header_row + 1, last_row + 1):
+        state_val = ws.cell(row=r, column=label_col).value
+        if state_val is None or (isinstance(state_val, str) and state_val.strip() == ""):
+            continue
+        if fallback is None:
+            fallback = state_val
+        # Sum each day-block to find days with hours on this line item.
+        for day_idx, start_col in enumerate(day_start_cols):
+            block_total = 0.0
+            for off in range(pay_block_width):
+                cell = ws.cell(row=r, column=start_col + off).value
+                if isinstance(cell, (int, float)) and not (
+                    isinstance(cell, float) and 0.0 <= cell < 1.0
+                ):
+                    block_total += abs(float(cell))
+            if block_total > 0 and day_idx not in per_day:
+                per_day[day_idx] = state_val
+
+    return per_day, fallback
+
+
+def resolve_state_for_hours_row(
+    ws, label: str, header_row: int, day_start_cols: list[int],
+    max_scan_rows: int = 30,
+) -> tuple[object, str]:
+    """Find the value of a per-line-item state column (e.g. 'WC STATE', 'ST') by
+    picking the line-item row that has the most worked hours.
+
+    On sheets with multiple line items (Federline-style storm-week sheets), the
+    WC STATE column carries one value per line item. The manager's rule:
+    use the WC State of the row that actually carries worked hours, not the
+    first non-empty cell. We pick the row whose day-block cells (any of
+    RT/OT/DT/PD/4D/4A/PTO/HP/PP at the recognised pay-type columns) sum to the
+    largest magnitude. If no row has any hours, fall back to the first non-
+    empty value below the header.
+
+    Returns (value, status). status is 'ok' for hours-driven pick, 'fallback'
+    for first-non-empty fallback, 'missing' if the column wasn't found.
+    """
+    # 1. Locate the label column in the header row.
+    label_up = label.strip().upper()
+    label_col = None
+    cmax = min(ws.max_column or 0, 80)
+    for c in range(1, cmax + 1):
+        v = ws.cell(row=header_row, column=c).value
+        if isinstance(v, str) and v.strip().upper() == label_up:
+            label_col = c
+            break
+    if label_col is None:
+        return None, "missing"
+
+    # 2. Walk line-item rows below the header, collecting (row, value, hours).
+    last_row = min((ws.max_row or header_row) + 1, header_row + max_scan_rows)
+    candidates: list[tuple[int, object, float]] = []
+    for r in range(header_row + 1, last_row + 1):
+        v = ws.cell(row=r, column=label_col).value
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            continue
+        # Skip aggregate / summary rows where the column carries a known
+        # non-state literal (rare; usually the value is the state code).
+        # Sum hours across all day-block columns for this row.
+        hours = 0.0
+        for c in day_start_cols:
+            # Scan a small window from each day-start to capture every
+            # pay-type cell in the block. Stride between days bounds the scan.
+            # Width = up to 8 (max pay-type variants per day).
+            for off in range(8):
+                cell = ws.cell(row=r, column=c + off).value
+                if isinstance(cell, (int, float)) and not (
+                    isinstance(cell, float) and 0.0 <= cell < 1.0
+                ):
+                    hours += abs(float(cell))
+        candidates.append((r, v, hours))
+
+    if not candidates:
+        return None, "missing"
+
+    # 3. Prefer the row with the most hours; if all are zero, fall back to
+    #    the first non-empty value.
+    with_hours = [c for c in candidates if c[2] > 0]
+    if with_hours:
+        best = max(with_hours, key=lambda x: (x[2], -x[0]))
+        return best[1], "ok"
+    return candidates[0][1], "fallback"
 
 
 def find_fm_job_col(ws, header_row: int) -> int | None:
@@ -547,16 +717,49 @@ def discover_field_mechanic_paytype_cols(ws, header_row: int
     grid: dict[tuple[int, str], int] = {}
     day_indices: set[int] = set()
     pay_types_seen: list[str] = []
+
+    # Derive the day-1 column bounds from the day-label row. A bare-suffix
+    # token (e.g. 'PP') is only treated as day-1 when it sits inside the
+    # day-1 block — otherwise grand-totals summary labels like bare 'PTO'
+    # / 'HP' / 'PP' at cols 50+ would overwrite legitimate 'PTO1'/'HP1'
+    # mappings (Adam Peart, Rancho Office Brothers regression).
+    day_info = find_day_label_row(ws)
+    day1_start: int | None = None
+    day1_end: int | None = None
+    if day_info is not None:
+        day_label_row, first_day_col = day_info
+        # Collect day columns in row-order to compute stride.
+        day_cols: list[int] = []
+        cmax_day = min(ws.max_column or 0, 120)
+        for cc in range(1, cmax_day + 1):
+            dv = ws.cell(row=day_label_row, column=cc).value
+            if isinstance(dv, str) and dv.strip().upper() in ALL_DAY_TOKENS:
+                day_cols.append(cc)
+        if len(day_cols) >= 2:
+            day1_start = day_cols[0]
+            day1_end = day_cols[1] - 1
+
     cmax = min(ws.max_column or 0, 120)
     for c in range(1, cmax + 1):
         v = ws.cell(row=header_row, column=c).value
         if not isinstance(v, str):
             continue
-        m = PAYTYPE_DAY_RE.match(v.strip().upper())
+        # Accept the bare-token form (e.g. 'PP' on Rancho Runners day-1) by
+        # treating missing suffix as day index 1, BUT only when the column
+        # sits inside the day-1 block. Bare tokens in the grand-totals area
+        # (typical at cols 47+ on standard layouts) are summary headers,
+        # not per-day labels — Adam Peart / Brothers had bare 'PTO'/'HP'
+        # there overriding the real PTO1/HP1 mappings.
+        m = PAYTYPE_DAY_RE_OPTIONAL_SUFFIX.match(v.strip().upper())
         if not m:
             continue
         pt = m.group(1).upper()
-        day_num = int(m.group(2))
+        if m.group(2) is None:
+            if day1_start is None or not (day1_start <= c <= day1_end):
+                continue
+            day_num = 1
+        else:
+            day_num = int(m.group(2))
         if not (1 <= day_num <= 7):
             continue
         day_idx = day_num - 1
