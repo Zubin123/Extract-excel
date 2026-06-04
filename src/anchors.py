@@ -573,18 +573,23 @@ def resolve_state_per_day_from_line_items(
     ws, label: str, header_row: int, day_start_cols: list[int],
     pay_block_width: int = 6, max_scan_rows: int = 30,
 ) -> tuple[dict[int, object], object | None]:
-    """For each day, return the WC State / ST value taken from the line-item
-    row that actually carries that day's hours.
+    """For each day, return the WC State / ST value(s) taken from the line-
+    item row(s) that actually carry that day's hours.
 
     Returns (per_day, fallback) where:
-      - per_day[day_idx] = the state code (string) for line items with hours
-        on that day. Missing if no line item carries hours on that day.
+      - per_day[day_idx] = the state code for line items with hours on that
+        day. When multiple line items contribute (e.g. Raper THUR worked
+        4h in CA + 9h in NV on the same day), the values are joined with
+        `;` in the order they first appear in the source — e.g. 'CA;NV'.
+        Each distinct code appears at most once. Missing if no line item
+        carries hours on that day.
       - fallback = the first non-empty value in the label column, used for
         days with no hours.
 
     The manager's rule: each output row's WC State / ST should reflect the
     work-state of THAT day's line item, not a single per-employee value.
-    Hilyard 01/19/23 worked at OR (one line item); other days at CA.
+    Hilyard 01/19/23 worked at OR (one line item) — other days at CA.
+    Raper THUR/FRI worked at CA + NV both — output 'CA;NV'.
     """
     label_up = label.strip().upper()
     label_col = None
@@ -598,12 +603,19 @@ def resolve_state_per_day_from_line_items(
         return {}, None
 
     last_row = min((ws.max_row or header_row) + 1, header_row + max_scan_rows)
-    per_day: dict[int, object] = {}
+    # Per-day list of distinct codes in first-seen order.
+    per_day_codes: dict[int, list[str]] = {}
     fallback: object | None = None
 
     for r in range(header_row + 1, last_row + 1):
         state_val = ws.cell(row=r, column=label_col).value
         if state_val is None or (isinstance(state_val, str) and state_val.strip() == ""):
+            continue
+        # Long descriptive cells (e.g. ST column carrying a help text 30+
+        # chars long) are clearly not state codes — skip them. State codes
+        # are short tokens like 'CA', 'OR', 'NV', '7538CA'.
+        sv_str = state_val if isinstance(state_val, str) else str(state_val)
+        if len(sv_str.strip()) > 12:
             continue
         if fallback is None:
             fallback = state_val
@@ -616,9 +628,16 @@ def resolve_state_per_day_from_line_items(
                     isinstance(cell, float) and 0.0 <= cell < 1.0
                 ):
                     block_total += abs(float(cell))
-            if block_total > 0 and day_idx not in per_day:
-                per_day[day_idx] = state_val
+            if block_total > 0:
+                codes = per_day_codes.setdefault(day_idx, [])
+                code_str = sv_str.strip()
+                if code_str and code_str not in codes:
+                    codes.append(code_str)
 
+    per_day: dict[int, object] = {
+        di: ";".join(codes) if len(codes) > 1 else codes[0]
+        for di, codes in per_day_codes.items() if codes
+    }
     return per_day, fallback
 
 

@@ -32,7 +32,7 @@ from anchors import (  # noqa: E402
 )
 
 TOL = 0.01
-OUT = ROOT / "output" / "corpus_sample2_v2.xlsx"
+OUT = ROOT / "output" / "corpus_2022.xlsx"
 DATA = ROOT / "data"
 
 
