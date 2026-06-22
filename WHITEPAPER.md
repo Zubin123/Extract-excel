@@ -4,17 +4,6 @@ A reliable, auditable pipeline that turns a folder of weekly timesheet workbooks
 
 ---
 
-## At a glance
-
-| | |
-|---|---|
-| **5,000+** | workbooks per run |
-| **3,896** | verified rows in the latest corpus |
-| **208 / 208** | known extraction issues resolved |
-| **0** | silent failures — every issue is flagged |
-
----
-
 ## The problem
 
 Every week, dozens of timesheets arrive as Excel workbooks, each carrying multiple employee sheets with hours, pay categories, dates, and worker classifications. Templates vary slightly between weeks and offices. Pulling all this data into one place — accurately, with every number verified — is the job this tool does.
@@ -28,6 +17,35 @@ Folder of workbooks   →   Pipeline runs   →   Verified output
 (any number of .xlsx)    (reads, verifies,    (5-tab spreadsheet)
                           flags)
 ```
+
+## Scope — what it works on
+
+The pipeline is built for one job: extracting tabular timesheet data out of native Excel workbooks. Within that scope, it's resilient to the kinds of template variation that show up in real-world files.
+
+### Works well on
+
+- Native Excel workbooks (`.xlsx` format)
+- Workbooks with multiple sheets — one per employee, plus reference sheets like job lists or employee rosters
+- Sheets that carry an employee name, an employee ID, and a weekly time grid (Monday through Sunday)
+- Sheets with a breakdown by pay category — Regular Time, Overtime, Double Time, Per Diem, and similar columns
+- Batches of similar files — the same template repeated across many weeks or many crews
+
+### Out of scope
+
+- Scanned PDFs or photographed timesheets — input must be native Excel, not images
+- Handwritten or fully freeform sheets with no consistent column structure
+- Non-tabular layouts (narrative timesheets, notes-only sheets)
+- Live Google Sheets — export to `.xlsx` first
+- Encrypted or password-protected workbooks
+
+### Layout variations handled automatically
+
+Real timesheets are not pixel-identical. The pipeline adapts to:
+
+- Column shifts — a field that's normally in one column landing in the next column over
+- Header-row drift — headers appearing one row higher or lower than the standard template
+- Data-row gaps — values written a few rows below the header instead of directly below it
+- Alternate template variants — employee name appearing in a different cell than the standard layout
 
 ## What the output looks like
 
