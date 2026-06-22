@@ -2,7 +2,7 @@
 
 *Turning 5,000 timesheet workbooks into one verified payroll spreadsheet*
 
-How we built a reliable, auditable pipeline that extracts weekly payroll data with zero silent failures — and why this approach beats AI for payroll-grade reliability.
+A reliable, auditable pipeline that extracts weekly payroll data with zero silent failures — and why this approach beats AI for payroll-grade reliability.
 
 ---
 
@@ -11,19 +11,19 @@ How we built a reliable, auditable pipeline that extracts weekly payroll data wi
 | | |
 |---|---|
 | **5,000+** | files per run, no manual touch |
-| **3,896** | verified data rows in the latest corpus |
+| **3,896** | verified rows in the latest corpus |
 | **208 / 208** | known extraction issues resolved |
-| **0** | silent failures — every problem is flagged |
+| **0** | silent failures — every issue is flagged |
 
 ---
 
-## The problem we set out to solve
+## The problem
 
-Every week, dozens of timesheets arrive as Excel workbooks. Each contains multiple employee sheets with hours worked, pay categories (regular time, overtime, double time, per diem, etc.), dates, and worker classifications. Pulling all this into one place — accurately, on time, every week — meant hours of copy-paste, error-prone manual entry, and no easy way to audit later. Multiply by 5,000 historical files, and manual entry simply isn't viable.
+Every week, dozens of timesheets arrive as Excel workbooks, each carrying multiple employee sheets with hours, pay categories, dates, and classifications. Pulling this into one place — accurately, weekly — used to mean hours of copy-paste. Across 5,000 historical files, manual entry stops being viable.
 
 ## What we built
 
-A self-running tool that reads any number of timesheet Excel files in a folder and produces a **single verified payroll spreadsheet** — with every number cross-checked against the source workbook's own formulas. No human in the loop for the routine 99%. Humans only review the small handful of rows the tool itself flags.
+A self-running tool that reads any folder of timesheet Excel files and produces a **single verified payroll spreadsheet** — with every number cross-checked against the source workbook's own formulas. Humans only review the small handful of rows the tool flags.
 
 ```
 Folder of workbooks   →   Pipeline runs   →   Verified output
@@ -33,72 +33,57 @@ Folder of workbooks   →   Pipeline runs   →   Verified output
 
 ## How it works — in plain English
 
-Think of it as a very careful intern who doesn't get tired, doesn't make typos, never skips a sheet, and finishes thousands of timesheets in the time it takes to make coffee. The intern follows four rules:
+Think of it as a very careful intern who never tires, never makes typos, never skips a sheet, and finishes thousands of timesheets in the time it takes to make coffee. The intern follows four rules:
 
-1. **Read every sheet.** Walk through each workbook and identify which sheets are real employee timesheets vs reference data.
-2. **Find each field by its label, not by a fixed position.** Templates drift — a column gets inserted, a row shifts. The tool reads the header row to find each value, so small layout changes don't break it.
-3. **Cross-check the math.** Add up Monday-to-Sunday hours per pay category, compare to Excel's own weekly total. A mismatch flags the row — it doesn't silently accept it.
-4. **Surface everything.** Output has five clearly labeled tabs: the data itself, a per-employee accuracy summary, the run log, sheets that couldn't be safely extracted, and EE-ID conflicts. Nothing is hidden.
+1. **Read every sheet.** Identify which sheets are real employee timesheets vs reference data.
+2. **Find each field by its label, not by a fixed position.** If a column shifts or a row gets inserted, the tool still finds the value by reading the header.
+3. **Cross-check the math.** Sum Monday-to-Sunday hours per pay category, compare to Excel's own weekly total. A mismatch flags the row — it doesn't silently accept it.
+4. **Surface everything.** Output has five clearly labeled tabs — data, accuracy summary, run log, sheets that couldn't be extracted, and ID conflicts. Nothing is hidden.
 
 ## Accuracy — what we can guarantee
 
-- ✓ **Deterministic.** Same input always produces the same output, every run.
-- ✓ **Self-validating.** Every numeric column is cross-checked against Excel's own totals.
-- ✓ **Auditable.** Each output cell traces back to a specific source cell.
-- ✓ **No silent drops.** Sheets that can't be safely extracted are visibly listed with a reason.
+- ✓ **Deterministic.** Same input → same output, every run.
+- ✓ **Self-validating.** Every numeric column is cross-checked.
+- ✓ **Auditable.** Each output cell traces back to a source cell.
+- ✓ **No silent drops.** Sheets we can't extract are visibly listed with reasons.
 
-## Scale — how fast it runs
+## Scale
 
 | Volume | Single-threaded | Parallelized |
 |---|--:|--:|
-| 1 workbook | ~10 sec | ~10 sec |
 | 100 workbooks | ~17 min | ~2 min |
 | 1,000 workbooks | ~3 hours | ~21 min |
 | 5,000 workbooks | ~14 hours | ~1.75 hours |
-| 10,000+ workbooks | ~28 hours | distribute via cloud |
+| 10,000+ | ~28 hours | distribute via cloud |
 
 ## Where this can be used
 
-- **Weekly payroll preparation** — consolidate timesheets from dozens of crews into one upload-ready file.
-- **Year-end audit & compliance reporting** — produce a clean, traceable record of hours worked across the year.
-- **Historical data migration** — moving years of legacy timesheets into a new HR/payroll system.
-- **Cross-company reconciliation** — comparing timesheets across job sites, companies, or pay periods.
-- **Any structured Excel data extraction** — the same approach works for invoices, expense reports, inspection logs.
+- **Weekly payroll preparation** — consolidate timesheets from many crews into one upload-ready file.
+- **Year-end audit & compliance** — produce a clean, traceable record of hours worked.
+- **Historical data migration** — move years of legacy timesheets into a new HR/payroll system.
+- **Cross-site reconciliation** — compare timesheets across job sites or pay periods.
+- **Other structured Excel extraction** — same approach works for invoices, expense reports, inspection logs.
 
 ## Why not AI or OCR?
 
-We deliberately chose **not** to use an AI model (LLM) or OCR engine. The reasoning:
+We deliberately chose **not** to use an AI model or OCR engine for the main data path:
 
 | | Our approach | AI / LLM approach |
 |---|--:|--:|
 | Cost per 5,000-file run | $0 | ~$1,500–$15,000 |
-| Same input → same output? | Always | No (varies between runs) |
+| Same input → same output? | Always | No, varies between runs |
 | Traceable to source cell? | Every cell | No |
 | Can invent values? | Never | Yes (hallucination risk) |
 | Speed (5,000 files) | ~2 hours | ~40+ hours |
 
-OCR adds no value when the input is already `.xlsx` — every cell already has structured text and formulas. AI is the right tool for some problems; payroll arithmetic is not one of them. We may use AI later as a *fallback* for the few sheets the deterministic pipeline can't handle, but never for the main data path.
+OCR adds no value when the input is already `.xlsx` — every cell already has structured text. AI is the right tool for some problems; payroll arithmetic is not one of them.
 
-## What "automation" means here
+## What "automation" really means here
 
 > **Not magic. Not AI. Just precise rules executed reliably.**
 >
 > Write down the rules once. Write them precisely. Run them across thousands of files. Surface anything the rules can't safely handle. Boring on purpose — and boring is what makes it reliable enough for payroll.
 
-## The benefits in one paragraph
+## The benefits
 
-What used to take a person **days** of manual copying now runs in **hours**, with every number cross-checked, every problem row flagged, and every output cell traceable to its source. There is no ongoing infrastructure cost. The pipeline is reproducible — running it again tomorrow on the same files produces the same answer. And it scales: the same code that handles 40 workbooks today will handle 5,000 next month with no rewrites.
-
-## Current status
-
-- Phase 1 (single-file extraction with QA) — **Done**
-- Phase 2 (batch mode + layered QA flags) — **Done**
-- Phase 3 (layout-drift resilience, header-verified field detection) — **Done**. All 208 reported feedback issues resolved.
-- Phase 4 (parallelization for sub-1-hour runs on 5,000 files) — Next
-- Phase 5 (scheduled / cloud pipeline for ongoing weekly ingestion) — Pending volume & cadence decision
-
----
-
-**Source code:** [github.com/Zubin123/Extract-excel](https://github.com/Zubin123/Extract-excel)
-**Stack:** Python 3.12, pandas, openpyxl — no cloud dependencies, runs on any laptop or server.
-**Prepared by:** Mohammed Zubin · iBridge Global Services
+What used to take a person **days** of manual copying now runs in **hours**, with every number cross-checked, every problem row flagged, and every output cell traceable to its source. No ongoing infrastructure cost. Reproducible. And it scales — the same code that handles 40 workbooks today will handle 5,000 next month with no rewrites.
